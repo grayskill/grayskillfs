@@ -11,13 +11,24 @@ libraries are not needed. Mounting requires Linux 5.8+ (`openat2` and
 `utimensat(AT_EMPTY_PATH)`), mounted `/proc`, `/dev/fuse`, and `fusermount3`.
 
 ```sh
-cargo build --release --locked
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked
+make                  # Build target/release/grayskillfs.
+make test             # Automated tests without requiring a FUSE mount.
+make do-lint          # Formatting and strict Clippy checks.
 # Explicitly exercise a real, unprivileged mount; also requires make on PATH.
-cargo test --locked --test mounted -- --ignored --nocapture
+make test-mounted
+make help
 ```
+
+Make directs the build and delegates Rust input tracking to Cargo. Build, test,
+and lint targets can run together with `make -j`. Required system tools are
+checked before running each target. Cargo fetches locked Rust dependencies as
+needed. Override `CARGO` or `CARGO_TARGET_DIR` to select the Cargo executable or
+build output directory.
+
+`make clean` removes Cargo outputs. `make distclean` is equivalent because all
+generated build files are in the Cargo output directory; both preserve
+`Cargo.lock` and sources. Run cleanup separately from build/test/lint targets
+to avoid deleting outputs in use.
 
 The mounted test creates its own temporary backing directories and local Git
 repository, mounts the CLI in the foreground, exercises filesystem operations,
