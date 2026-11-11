@@ -1,0 +1,18 @@
+[package]
+name = "grayskillfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A selector-addressed layered filesystem for sandbox roots"
+
+[dependencies]
+base64 = "0.22"
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
