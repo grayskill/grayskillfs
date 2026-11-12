@@ -333,7 +333,14 @@ fn mounted_privilege_drop_is_git_only() {
     ) {
         return;
     }
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    let sessions = fixture.temp.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o711)).unwrap();
+    fixture.config.push_str(&format!(
+        "pathsubst {}/{{{{uid}}}}/{{{{path}}}} onto /tmp as read-write mkdir mode=0700 uid={{{{uid}}}} gid={{{{gid}}}}\n",
+        sessions.display()
+    ));
     let cache = fixture.temp.path().join("cache");
     fs::create_dir(&cache).unwrap();
     common::chown_tree(&fixture.repo, 65534, 65534);
@@ -362,7 +369,7 @@ fn mounted_privilege_drop_is_git_only() {
         0,
         "Git cache must be lazy"
     );
-    let root = mount.path.join(fixture.symbolic()).join("alice");
+    let root = mount.path.join(fixture.symbolic()).join("alice/session");
     assert_eq!(fs::read(root.join("package/repo.txt")).unwrap(), b"git\n");
     let status = fs::read_to_string(format!("/proc/{}/status", mount.child.id())).unwrap();
     for field in ["Uid:", "Gid:"] {
@@ -391,6 +398,7 @@ fn mounted_privilege_drop_is_git_only() {
             mv package/data/created package/data/renamed
             chmod 640 package/data/renamed
             printf updated > package/data/existing
+            printf session > tmp/created
             if rm package/data/sticky/secret; then exit 1; fi
             ls package/data >/dev/null
         "#,
@@ -415,6 +423,17 @@ fn mounted_privilege_drop_is_git_only() {
     assert_eq!((existing.uid(), existing.gid()), (0, 0));
     assert_eq!(fs::read(data.join("existing")).unwrap(), b"updated");
     assert_eq!(fs::read(data.join("sticky/secret")).unwrap(), b"root-owned");
+    for path in [sessions.join("65533"), sessions.join("65533/session")] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (65533, 65532, 0o700)
+        );
+    }
+    assert_eq!(
+        fs::read(sessions.join("65533/session/created")).unwrap(),
+        b"session"
+    );
     assert_eq!(fs::read(root.join("package/repo.txt")).unwrap(), b"git\n");
     for entry in fs::read_dir(&cache).unwrap() {
         let entry = entry.unwrap();

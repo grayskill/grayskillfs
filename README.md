@@ -97,7 +97,8 @@ pathsubst /srv/data/{{uid}} onto /package/data as read-write
 dev char 1 3 onto /dev/null as read-write
 ```
 
-Create the backing directories before using them. A layer consumes one selector
+Create the backing directories before using them, or explicitly enable
+`mkdir` as described below. A layer consumes one selector
 component **only if its source contains `{{path}}`**, regardless of how many
 times that placeholder appears. `{{path}}` is that layer's single selector
 component, not a path or a previous selector. Fixed sources and sources using
@@ -119,7 +120,8 @@ Nested mounts are injected into directory listings, and missing intermediate
 directories are synthesized. A later parent mount hides any earlier nested
 mounts. Host-path sources must be directories and Git layers must be read-only.
 UID-dependent directories are resolved on access, not required at mount startup;
-a missing directory returns an error rather than falling back to another UID.
+a missing directory returns an error unless `mkdir` is enabled, never falling
+back to another UID.
 
 ```sh
 target/release/grayskillfs check /path/to/config
@@ -133,11 +135,47 @@ fusermount3 -u /path/to/mount
 ```
 
 `check` validates syntax without fetching repositories or opening sources.
-`mount` runs in the foreground and validates fixed sources immediately.
+`mount` runs in the foreground and validates fixed sources immediately, except
+sources explicitly configured for lazy creation.
 `--cache-dir DIRECTORY` chooses the parent of a private, per-mount temporary
 Git cache. The parent must exist; the cache is removed on normal unmount.
 The cache is created lazily on the first Git request, under the daemon's runtime
 credentials. No other user's cache or Git configuration is used.
+
+### Lazy source directory provisioning
+
+`path` and `pathsubst` layers can opt into creating missing source directories
+when the mapping is first accessed:
+
+```text
+pathsubst /srv/sessions/{{uid}}/{{path}} onto /tmp as read-write mkdir mode=0700 uid={{uid}} gid={{gid}}
+```
+
+This consumes one session-ID selector and exposes that session's directory as
+`/SESSION-ID/tmp`. Without `mkdir`, missing source directories still fail.
+The optional settings default to `mode=0700 uid={{uid}} gid={{gid}}`.
+`mode` is octal, from `0000` through `0777`; special mode bits are not supported.
+Both ownership fields accept numeric IDs or `{{uid}}`/`{{gid}}`, resolved from
+the current FUSE request's filesystem UID/GID. These ownership substitutions do
+not consume selectors; `{{gid}}` is supported in ownership options, not source
+paths. Metadata options require `mkdir`; Git and device layers reject them.
+
+All newly created path components receive the configured mode and ownership.
+**Existing directories are never chmodded or chowned**, even when their
+metadata differs from the configuration. Pre-create shared static prefixes
+such as `/srv/sessions` as root-owned, non-user-writable directories; otherwise
+the first caller may own newly created ancestors. Source provisioning uses the
+daemon's credentials, so a root daemon can provision caller-owned directories
+below a root-owned prefix. Non-root daemons cannot assign arbitrary ownership;
+creation or ownership failures are reported rather than faking metadata.
+
+Provisioning rejects symlinks and path traversal. New directories are prepared
+privately and atomically installed without replacing an existing entry.
+This needs a writable, protected staging ancestor on the same filesystem:
+root/daemon-owned and not group/other writable unless sticky. Existing sources
+need no staging. Read-only layers can provision sources too; their normal FUSE
+mutation restrictions still apply. The daemon does not expire or remove
+session directories; the launcher owns their lifecycle.
 
 ### Git subprocess and filesystem credentials
 
@@ -171,7 +209,8 @@ thread-local Linux `setfsuid()`/`setfsgid()`, restoring previous IDs after each
 request, including errors. New files, directories and symlinks therefore acquire
 the caller's actual backing ownership without post-creation chown; normal
 backing setgid-directory inheritance also applies. Existing ownership is not
-remapped. Git/cache maintenance temporarily uses the daemon's filesystem IDs,
+remapped. Git/cache maintenance and opt-in source provisioning temporarily use
+the daemon's filesystem IDs,
 independently of the requester, while Git children use `--user`.
 Supplementary groups are not impersonated; the kernel's `default_permissions`
 checks still use the caller's groups. A non-root daemon retains its own backing

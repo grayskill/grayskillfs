@@ -231,6 +231,7 @@ pub struct Namespace {
     git: GitStore,
     views: HashMap<(u32, Vec<OsString>), Arc<View>>,
     roots: HashMap<PathBuf, Arc<Root>>,
+    provisioned_roots: HashMap<PathBuf, Arc<Root>>,
 }
 
 impl Namespace {
@@ -248,12 +249,16 @@ impl Namespace {
             git: GitStore::new(cache, git_user),
             views: HashMap::new(),
             roots: HashMap::new(),
+            provisioned_roots: HashMap::new(),
         };
         let probe = Root::new(Path::new("/"))?;
         probe.probe_openat2()?;
         // Validate static mappings now, not on the first client access.
         for layer in namespace.config.layers.clone() {
-            if matches!(layer.kind, Kind::Path | Kind::PathSubst) && !layer.source.contains("{{") {
+            if matches!(layer.kind, Kind::Path | Kind::PathSubst)
+                && !layer.source.contains("{{")
+                && layer.provision.is_none()
+            {
                 namespace.root(Path::new(&layer.source))?;
             }
         }
@@ -290,6 +295,10 @@ impl Namespace {
     }
 
     pub fn lookup(&mut self, uid: u32, path: &Path) -> io::Result<Entry> {
+        self.lookup_with_gid(uid, unsafe { libc::getegid() }, path)
+    }
+
+    pub fn lookup_with_gid(&mut self, uid: u32, gid: u32, path: &Path) -> io::Result<Entry> {
         let mut parts = Vec::new();
         for part in path.components() {
             let Component::Normal(name) = part else {
@@ -354,6 +363,20 @@ impl Namespace {
                 let root = if layer.kind == Kind::Git {
                     let _credentials = FsCredentials::daemon()?;
                     self.root(&source)?
+                } else if let Some(provision) = &layer.provision {
+                    if let Some(root) = self.provisioned_roots.get(&source) {
+                        root.clone()
+                    } else {
+                        let _credentials = FsCredentials::daemon()?;
+                        let root = self.root(Path::new("/"))?.mkdir_p(
+                            source.strip_prefix("/").map_err(|_| errno(libc::EINVAL))?,
+                            provision.mode,
+                            provision.uid.resolve(uid, gid),
+                            provision.gid.resolve(uid, gid),
+                        )?;
+                        self.provisioned_roots.insert(source.clone(), root.clone());
+                        root
+                    }
                 } else if layer.kind == Kind::PathSubst && layer.source.contains("{{") {
                     self.substituted_root(&layer.source, &source)?
                 } else {
@@ -383,8 +406,18 @@ impl Namespace {
         parent: &Path,
         name: &std::ffi::OsStr,
     ) -> io::Result<Location> {
+        self.destination_with_gid(uid, unsafe { libc::getegid() }, parent, name)
+    }
+
+    pub fn destination_with_gid(
+        &mut self,
+        uid: u32,
+        gid: u32,
+        parent: &Path,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<Location> {
         component(name)?;
-        let parent = self.lookup(uid, parent)?;
+        let parent = self.lookup_with_gid(uid, gid, parent)?;
         if !parent.is_dir() {
             return Err(errno(libc::ENOTDIR));
         }

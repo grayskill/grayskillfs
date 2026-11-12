@@ -173,17 +173,17 @@ impl LayerFs {
             .ok_or_else(|| errno(libc::ESTALE))
     }
 
-    fn child(&mut self, parent: u64, name: &OsStr, uid: u32) -> io::Result<PathBuf> {
+    fn child(&mut self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> io::Result<PathBuf> {
         component(name)?;
         let parent = self.path(parent)?;
-        if !self.namespace.lookup(uid, &parent)?.is_dir() {
+        if !self.namespace.lookup_with_gid(uid, gid, &parent)?.is_dir() {
             return Err(errno(libc::ENOTDIR));
         }
         Ok(parent.join(name))
     }
 
-    fn entry(&mut self, ino: u64, uid: u32) -> io::Result<Entry> {
-        let entry = self.namespace.lookup(uid, &self.path(ino)?)?;
+    fn entry(&mut self, ino: u64, uid: u32, gid: u32) -> io::Result<Entry> {
+        let entry = self.namespace.lookup_with_gid(uid, gid, &self.path(ino)?)?;
         // Cached non-directory inodes must not be opened under a different UID:
         // the kernel page cache belongs to the original UID's inode.
         if ino != 1 && self.paths[&ino].uid != uid && !entry.is_dir() {
@@ -311,18 +311,25 @@ impl LayerFs {
         Ok(())
     }
 
-    fn remove(&mut self, parent: u64, name: &OsStr, directory: bool, uid: u32) -> io::Result<()> {
-        let path = self.child(parent, name, uid)?;
-        let entry = self.namespace.lookup(uid, &path)?;
+    fn remove(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        directory: bool,
+        uid: u32,
+        gid: u32,
+    ) -> io::Result<()> {
+        let path = self.child(parent, name, uid, gid)?;
+        let entry = self.namespace.lookup_with_gid(uid, gid, &path)?;
         let location = entry.mutation()?;
         location.root.unlink(&location.relative, directory)?;
         self.forget_path(&path, uid);
         Ok(())
     }
 
-    fn directory(&mut self, ino: u64, uid: u32) -> io::Result<Vec<DirEntry>> {
+    fn directory(&mut self, ino: u64, uid: u32, gid: u32) -> io::Result<Vec<DirEntry>> {
         let path = self.path(ino)?;
-        let entry = self.namespace.lookup(uid, &path)?;
+        let entry = self.namespace.lookup_with_gid(uid, gid, &path)?;
         let names = entry.children()?;
         let parent = self.inode(path.parent().unwrap_or(Path::new("")).to_owned(), uid);
         let mut entries = vec![
@@ -331,7 +338,7 @@ impl LayerFs {
         ];
         for name in names {
             let child = path.join(&name);
-            let entry = match self.namespace.lookup(uid, &child) {
+            let entry = match self.namespace.lookup_with_gid(uid, gid, &child) {
                 Ok(entry) => entry,
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
                 Err(error) => return Err(error),
@@ -348,8 +355,10 @@ impl Filesystem for LayerFs {
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         request_credentials!(req, reply);
         let result = (|| {
-            let path = self.child(parent, name, req.uid())?;
-            let entry = self.namespace.lookup(req.uid(), &path)?;
+            let path = self.child(parent, name, req.uid(), req.gid())?;
+            let entry = self
+                .namespace
+                .lookup_with_gid(req.uid(), req.gid(), &path)?;
             let ino = self.inode_for(path, &entry, req.uid());
             Ok(self.attr(ino, &entry))
         })();
@@ -374,7 +383,7 @@ impl Filesystem for LayerFs {
             {
                 return Ok(self.physical_attr(ino, &handle.file.metadata()?, handle.writable));
             }
-            let entry = self.entry(ino, req.uid())?;
+            let entry = self.entry(ino, req.uid(), req.gid())?;
             Ok(self.attr(ino, &entry))
         })();
         match result {
@@ -386,7 +395,7 @@ impl Filesystem for LayerFs {
     fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
         request_credentials!(req, reply);
         match self
-            .entry(ino, req.uid())
+            .entry(ino, req.uid(), req.gid())
             .and_then(|entry| entry.read_link())
         {
             Ok(target) => reply.data(target.as_bytes()),
@@ -397,7 +406,7 @@ impl Filesystem for LayerFs {
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         request_credentials!(req, reply);
         let result = (|| {
-            let entry = self.entry(ino, req.uid())?;
+            let entry = self.entry(ino, req.uid(), req.gid())?;
             let location = entry.location()?;
             let file = location.open(flags, 0)?;
             Ok(self.handle(file, ino, location.writable, req.uid()))
@@ -521,8 +530,8 @@ impl Filesystem for LayerFs {
     fn opendir(&mut self, req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         request_credentials!(req, reply);
         let result = (|| {
-            let entries = self.directory(ino, req.uid())?;
-            let entry = self.entry(ino, req.uid())?;
+            let entries = self.directory(ino, req.uid(), req.gid())?;
+            let entry = self.entry(ino, req.uid(), req.gid())?;
             let pinned = if let Node::Physical(location, _) = entry.node {
                 Some((
                     location.root.open(
@@ -629,7 +638,7 @@ impl Filesystem for LayerFs {
     fn statfs(&mut self, req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
         request_credentials!(req, reply);
         let result = (|| {
-            let entry = self.entry(ino, req.uid())?;
+            let entry = self.entry(ino, req.uid(), req.gid())?;
             let location = match &entry.node {
                 Node::Physical(location, _) => location,
                 _ => return Ok(None),
@@ -668,10 +677,14 @@ impl Filesystem for LayerFs {
         request_credentials!(req, reply);
         let result = (|| {
             let parent = self.path(parent)?;
-            let location = self.namespace.destination(req.uid(), &parent, name)?;
+            let location =
+                self.namespace
+                    .destination_with_gid(req.uid(), req.gid(), &parent, name)?;
             let file = location.open(flags | libc::O_CREAT, mode & !umask)?;
             let path = parent.join(name);
-            let entry = self.namespace.lookup(req.uid(), &path)?;
+            let entry = self
+                .namespace
+                .lookup_with_gid(req.uid(), req.gid(), &path)?;
             let ino = self.inode_for(path, &entry, req.uid());
             let attr = self.attr(ino, &entry);
             let fh = self.handle(file, ino, true, req.uid());
@@ -695,12 +708,16 @@ impl Filesystem for LayerFs {
         request_credentials!(req, reply);
         let result = (|| {
             let parent = self.path(parent)?;
-            let location = self.namespace.destination(req.uid(), &parent, name)?;
+            let location =
+                self.namespace
+                    .destination_with_gid(req.uid(), req.gid(), &parent, name)?;
             location
                 .root
                 .mkdir(&location.relative, mode & !umask & 0o777)?;
             let path = parent.join(name);
-            let entry = self.namespace.lookup(req.uid(), &path)?;
+            let entry = self
+                .namespace
+                .lookup_with_gid(req.uid(), req.gid(), &path)?;
             let ino = self.inode_for(path, &entry, req.uid());
             Ok(self.attr(ino, &entry))
         })();
@@ -712,7 +729,7 @@ impl Filesystem for LayerFs {
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         request_credentials!(req, reply);
-        match self.remove(parent, name, false, req.uid()) {
+        match self.remove(parent, name, false, req.uid(), req.gid()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(error(e)),
         }
@@ -720,7 +737,7 @@ impl Filesystem for LayerFs {
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         request_credentials!(req, reply);
-        match self.remove(parent, name, true, req.uid()) {
+        match self.remove(parent, name, true, req.uid(), req.gid()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(error(e)),
         }
@@ -737,10 +754,14 @@ impl Filesystem for LayerFs {
         request_credentials!(req, reply);
         let result = (|| {
             let parent = self.path(parent)?;
-            let location = self.namespace.destination(req.uid(), &parent, name)?;
+            let location =
+                self.namespace
+                    .destination_with_gid(req.uid(), req.gid(), &parent, name)?;
             location.root.symlink(&location.relative, target)?;
             let path = parent.join(name);
-            let entry = self.namespace.lookup(req.uid(), &path)?;
+            let entry = self
+                .namespace
+                .lookup_with_gid(req.uid(), req.gid(), &path)?;
             let ino = self.inode_for(path, &entry, req.uid());
             Ok(self.attr(ino, &entry))
         })();
@@ -766,12 +787,15 @@ impl Filesystem for LayerFs {
                 return Err(errno(libc::EOPNOTSUPP));
             }
             let uid = req.uid();
-            let from = self.child(parent, name, uid)?;
+            let gid = req.gid();
+            let from = self.child(parent, name, uid, gid)?;
             let to_parent = self.path(newparent)?;
             let to = to_parent.join(newname);
-            let entry = self.namespace.lookup(uid, &from)?;
+            let entry = self.namespace.lookup_with_gid(uid, gid, &from)?;
             let source = entry.mutation()?;
-            let destination = self.namespace.destination(uid, &to_parent, newname)?;
+            let destination = self
+                .namespace
+                .destination_with_gid(uid, gid, &to_parent, newname)?;
             Self::same_mount(source, &destination)?;
             source.root.rename(
                 &source.relative,
@@ -834,14 +858,18 @@ impl Filesystem for LayerFs {
     ) {
         request_credentials!(req, reply);
         let result = (|| {
-            let entry = self.entry(ino, req.uid())?;
+            let entry = self.entry(ino, req.uid(), req.gid())?;
             let source = entry.mutation()?;
             let parent = self.path(newparent)?;
-            let destination = self.namespace.destination(req.uid(), &parent, newname)?;
+            let destination =
+                self.namespace
+                    .destination_with_gid(req.uid(), req.gid(), &parent, newname)?;
             Self::same_mount(source, &destination)?;
             source.root.link(&source.relative, &destination.relative)?;
             let path = parent.join(newname);
-            let entry = self.namespace.lookup(req.uid(), &path)?;
+            let entry = self
+                .namespace
+                .lookup_with_gid(req.uid(), req.gid(), &path)?;
             let ino = self.inode_for(path, &entry, req.uid());
             Ok(self.attr(ino, &entry))
         })();
@@ -884,7 +912,7 @@ impl Filesystem for LayerFs {
             let file = if let Some(fh) = fh {
                 self.file(fh, ino, true)?
             } else {
-                let entry = self.entry(ino, req.uid())?;
+                let entry = self.entry(ino, req.uid(), req.gid())?;
                 let location = entry.location()?;
                 location.writable()?;
                 owned = if size.is_some() {

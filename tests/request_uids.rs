@@ -10,6 +10,7 @@ struct Protocol {
     socket: UnixDatagram,
     worker: Option<JoinHandle<std::io::Result<()>>>,
     unique: u64,
+    gid: u32,
 }
 
 fn u64_at(bytes: &[u8], offset: usize) -> u64 {
@@ -31,6 +32,7 @@ impl Protocol {
             socket,
             worker: Some(worker),
             unique: 0,
+            gid: 100,
         };
         let init = [7u32, 31, 0, 0]
             .into_iter()
@@ -47,7 +49,7 @@ impl Protocol {
         message.extend_from_slice(&opcode.to_ne_bytes());
         message.extend_from_slice(&self.unique.to_ne_bytes());
         message.extend_from_slice(&ino.to_ne_bytes());
-        for field in [uid, 100, std::process::id(), 0] {
+        for field in [uid, self.gid, std::process::id(), 0] {
             message.extend_from_slice(&field.to_ne_bytes());
         }
         message.extend_from_slice(payload);
@@ -205,5 +207,66 @@ fn privilege_drop_fuse_requests_preserve_caller_ownership() {
     ) {
         fuse_requests_select_uid_views_inodes_and_mutation_destinations();
     }
+}
+
+#[test]
+#[ignore = "requires user namespaces and subordinate UID/GID mappings"]
+fn privilege_drop_mkdir_p_uses_request_uid_and_gid() {
+    if !common::in_user_namespace(
+        "privilege_drop_mkdir_p_uses_request_uid_and_gid",
+        "GRAYSKILLFS_PROVISION_TEST_CHILD",
+    ) {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let base = temp.path().join("base");
+    let sessions = temp.path().join("sessions");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&sessions).unwrap();
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o711)).unwrap();
+    let config = format!(
+            "path {} onto / as read-only\n\
+             pathsubst {}/{{{{uid}}}}/{{{{path}}}} onto /tmp as read-write mkdir uid={{{{uid}}}} gid={{{{gid}}}}\n",
+            base.display(), sessions.display()
+        );
+    let config = format!(
+        "{config}path {} onto /fixed as read-only mkdir mode=0755 uid=65534 gid=65530\n",
+        temp.path().join("fixed").display()
+    );
+    let namespace = Namespace::new(Config::parse(&config).unwrap(), None).unwrap();
+    let mut fs = Protocol::new(namespace);
+    fs.gid = 65532;
+    let first = fs.lookup(65533, 1, "first");
+    let tmp = fs.lookup(65533, first, "tmp");
+    let (created, handle) = fs.create(65533, tmp, "created");
+    fs.write(65533, created, handle, b"caller-owned");
+    let user = sessions.join("65533");
+    for path in [&user, &user.join("first")] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (65533, 65532, 0o700)
+        );
+    }
+    assert_eq!(
+        fs::read(user.join("first/created")).unwrap(),
+        b"caller-owned"
+    );
+    let fixed = fs::metadata(temp.path().join("fixed")).unwrap();
+    assert_eq!(
+        (fixed.uid(), fixed.gid(), fixed.mode() & 0o777),
+        (65534, 65530, 0o755)
+    );
+    fs.gid = 65531;
+    fs.lookup(65533, 1, "second");
+    assert_eq!(fs::metadata(user.join("second")).unwrap().gid(), 65531);
+    assert_eq!(fs::metadata(&user).unwrap().gid(), 65532);
+    fs.lookup(65534, 1, "first");
+    assert_eq!(
+        fs::metadata(sessions.join("65534/first")).unwrap().uid(),
+        65534
+    );
+    assert_eq!(fs::metadata(sessions).unwrap().mode() & 0o777, 0o711);
 }
 mod common;

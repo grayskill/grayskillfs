@@ -3,6 +3,7 @@ use std::fs::{self, File, Metadata};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -136,6 +137,107 @@ impl Root {
     pub fn mkdir(&self, path: &Path, mode: u32) -> io::Result<()> {
         let (parent, name) = self.parent(path)?;
         check(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) })
+    }
+
+    pub fn mkdir_p(
+        self: &Arc<Self>,
+        path: &Path,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> io::Result<Arc<Self>> {
+        if mode > 0o777 || uid == u32::MAX || gid == u32::MAX {
+            return Err(errno(libc::EINVAL));
+        }
+        if path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(errno(libc::EINVAL));
+        }
+        let mut current = self.clone();
+        let mut staging: Option<(Arc<Self>, u64)> = None;
+        for part in path.components() {
+            let metadata = current.directory.metadata()?;
+            if staging
+                .as_ref()
+                .is_some_and(|(_, dev)| *dev != metadata.dev())
+            {
+                staging = None;
+            }
+            // A protected ancestor keeps an attacker from replacing the staging
+            // directory before it is pinned. Sticky directories protect its owner.
+            if (metadata.uid() == unsafe { libc::geteuid() } || metadata.uid() == 0)
+                && (metadata.mode() & 0o022 == 0 || metadata.mode() & libc::S_ISVTX != 0)
+            {
+                let access = unsafe {
+                    libc::syscall(
+                        libc::SYS_faccessat2,
+                        current.directory.as_raw_fd(),
+                        c"".as_ptr(),
+                        libc::W_OK | libc::X_OK,
+                        libc::AT_EMPTY_PATH | libc::AT_EACCESS,
+                    )
+                };
+                if access == 0 {
+                    staging = Some((current.clone(), metadata.dev()));
+                } else {
+                    let error = io::Error::last_os_error();
+                    if !matches!(error.raw_os_error(), Some(libc::EACCES | libc::EROFS)) {
+                        return Err(error);
+                    }
+                }
+            }
+            let name = Path::new(part.as_os_str());
+            match current.subdir(name) {
+                Ok(directory) => current = directory,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    let (protected, _) = staging.as_ref().ok_or_else(|| {
+                        io::Error::other(
+                            "mkdir requires a protected staging ancestor on the same filesystem",
+                        )
+                    })?;
+                    current.provision_directory(name, protected, mode, uid, gid)?;
+                    current = current.subdir(name)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(current)
+    }
+
+    fn provision_directory(
+        &self,
+        name: &Path,
+        protected: &Root,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> io::Result<()> {
+        let staging = tempfile::Builder::new()
+            .prefix(".grayskillfs-mkdir-")
+            .tempdir_in(format!("/proc/self/fd/{}", protected.directory.as_raw_fd()))?;
+        let root = Root::new(staging.path())?;
+        let child = Path::new("directory");
+        root.mkdir(child, 0o700)?;
+        let result = (|| {
+            let file = root.open(child, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            check(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) })?;
+            check(unsafe { libc::fchmod(file.as_raw_fd(), mode) })?;
+            root.rename(child, self, name, libc::RENAME_NOREPLACE)
+        })();
+        if let Err(error) = result {
+            root.unlink(child, true).map_err(|cleanup| {
+                io::Error::other(format!(
+                    "mkdir failed: {error}; staging cleanup failed: {cleanup}"
+                ))
+            })?;
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+        staging.close()?;
+        Ok(())
     }
 
     pub fn unlink(&self, path: &Path, directory: bool) -> io::Result<()> {

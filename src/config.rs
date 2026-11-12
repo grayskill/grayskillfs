@@ -29,12 +29,105 @@ impl Device {
 }
 
 #[derive(Clone, Debug)]
+pub enum OwnerId {
+    Uid,
+    Gid,
+    Fixed(u32),
+}
+
+impl OwnerId {
+    fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "{{uid}}" => Ok(Self::Uid),
+            "{{gid}}" => Ok(Self::Gid),
+            _ if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                match value.parse::<u32>() {
+                    Ok(id) if id != u32::MAX => Ok(Self::Fixed(id)),
+                    _ => Err(invalid("invalid ownership ID")),
+                }
+            }
+            _ => Err(invalid(
+                "ownership requires a numeric ID, {{uid}}, or {{gid}}",
+            )),
+        }
+    }
+
+    pub fn resolve(&self, uid: u32, gid: u32) -> u32 {
+        match self {
+            Self::Uid => uid,
+            Self::Gid => gid,
+            Self::Fixed(id) => *id,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Provision {
+    pub mode: u32,
+    pub uid: OwnerId,
+    pub gid: OwnerId,
+}
+
+impl Provision {
+    fn parse(options: &[&str]) -> io::Result<Option<Self>> {
+        let mut mkdir = false;
+        let mut mode = None;
+        let mut uid = None;
+        let mut gid = None;
+        for option in options {
+            if *option == "mkdir" && !mkdir {
+                mkdir = true;
+            } else if let Some(value) = option.strip_prefix("mode=") {
+                if mode.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|byte| (b'0'..=b'7').contains(&byte))
+                {
+                    return Err(invalid("expected one octal mode between 0000 and 0777"));
+                }
+                let value =
+                    u32::from_str_radix(value, 8).map_err(|_| invalid("invalid directory mode"))?;
+                if value > 0o777 {
+                    return Err(invalid("directory mode must be between 0000 and 0777"));
+                }
+                mode = Some(value);
+            } else if let Some(value) = option.strip_prefix("uid=") {
+                if uid.is_some() {
+                    return Err(invalid("duplicate uid option"));
+                }
+                uid = Some(OwnerId::parse(value)?);
+            } else if let Some(value) = option.strip_prefix("gid=") {
+                if gid.is_some() {
+                    return Err(invalid("duplicate gid option"));
+                }
+                gid = Some(OwnerId::parse(value)?);
+            } else {
+                return Err(invalid(format!(
+                    "unknown or duplicate layer option: {option}"
+                )));
+            }
+        }
+        if !mkdir {
+            if !options.is_empty() {
+                return Err(invalid("mode, uid, and gid options require mkdir"));
+            }
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            mode: mode.unwrap_or(0o700),
+            uid: uid.unwrap_or(OwnerId::Uid),
+            gid: gid.unwrap_or(OwnerId::Gid),
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Layer {
     pub kind: Kind,
     pub source: String,
     pub target: PathBuf,
     pub writable: bool,
     pub consumes: bool,
+    pub provision: Option<Provision>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,7 +178,7 @@ impl Config {
                         words[7],
                     )
                 } else {
-                    if words.len() != 6 || words[2] != "onto" || words[4] != "as" {
+                    if words.len() < 6 || words[2] != "onto" || words[4] != "as" {
                         return Err(invalid(
                             "expected KIND SOURCE onto /TARGET as read-only|read-write",
                         ));
@@ -102,6 +195,16 @@ impl Config {
                     "read-only" => false,
                     "read-write" => true,
                     _ => return Err(invalid("unknown access mode")),
+                };
+                let provision = if matches!(kind, Kind::Path | Kind::PathSubst) {
+                    Provision::parse(&words[6..])?
+                } else {
+                    if kind == Kind::Git && words.len() != 6 {
+                        return Err(invalid(
+                            "directory provisioning is only supported for path and pathsubst",
+                        ));
+                    }
+                    None
                 };
                 if kind == Kind::Git
                     && (writable || (source.contains("{{") && source != "{{path}}"))
@@ -142,6 +245,7 @@ impl Config {
                     target,
                     writable,
                     consumes,
+                    provision,
                 })
             };
             layers.push(parse().map_err(|e| invalid(format!("line {}: {e}", index + 1)))?);

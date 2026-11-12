@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 #[test]
@@ -35,9 +36,166 @@ fn configuration_semantics_and_errors() {
         "git {{path}} onto / as read-write",
         "no-consume git {{path}} onto / as read-only",
         "git {{uid}} onto / as read-only",
+        "path /base onto / as read-only mode=0700",
+        "path /base onto / as read-only mkdir-p",
+        "path /base onto / as read-only mkdir mkdir",
+        "path /base onto / as read-only mkdir mode=1777",
+        "path /base onto / as read-only mkdir mode=0780",
+        "path /base onto / as read-only mkdir mode=0700 mode=0755",
+        "path /base onto / as read-only mkdir uid=4294967295",
+        "path /base onto / as read-only mkdir gid={{path}}",
+        "git {{path}} onto / as read-only mkdir",
+        "dev char 1 3 onto / as read-write mkdir",
     ] {
         assert!(Config::parse(text).is_err(), "accepted {text}");
     }
+}
+
+#[test]
+fn mkdir_p_is_lazy_and_preserves_existing_directory_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    let sessions = temp.path().join("sessions");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&sessions).unwrap();
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o711)).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let config = format!(
+        "path {} onto / as read-only\n\
+         pathsubst {}/{{{{uid}}}}/{{{{path}}}} onto /tmp as read-write mkdir mode=0750 uid={{{{uid}}}} gid={{{{gid}}}}\n",
+        base.display(), sessions.display()
+    );
+    let mut namespace = Namespace::new(Config::parse(&config).unwrap(), None).unwrap();
+    assert!(!sessions.join(uid.to_string()).exists());
+    namespace.lookup_with_gid(uid, gid, Path::new("")).unwrap();
+    assert!(!sessions.join(uid.to_string()).exists());
+    let entry = namespace
+        .lookup_with_gid(uid, gid, Path::new("first/tmp"))
+        .unwrap();
+    assert!(entry.is_dir());
+    let user = sessions.join(uid.to_string());
+    let first = user.join("first");
+    for path in [&user, &first] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (uid, gid, 0o750)
+        );
+    }
+    assert_eq!(fs::metadata(&sessions).unwrap().mode() & 0o777, 0o711);
+
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o711)).unwrap();
+    let changed = config.replace(
+        "mode=0750 uid={{uid}} gid={{gid}}",
+        "mode=0700 uid=12345 gid=23456",
+    );
+    let mut namespace = Namespace::new(Config::parse(&changed).unwrap(), None).unwrap();
+    namespace
+        .lookup_with_gid(uid, gid, Path::new("first/tmp"))
+        .unwrap();
+    let metadata = fs::metadata(&first).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+        (uid, gid, 0o711)
+    );
+    assert_eq!(fs::metadata(&user).unwrap().mode() & 0o777, 0o750);
+}
+
+#[test]
+fn mkdir_p_supports_fixed_sources_and_reports_ownership_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("fixed/nested");
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let config = format!(
+        "path {} onto / as read-only mkdir mode=0710 uid={uid} gid={gid}\n",
+        source.display()
+    );
+    let mut namespace = Namespace::new(Config::parse(&config).unwrap(), None).unwrap();
+    assert!(!source.exists());
+    namespace.lookup(uid, Path::new("")).unwrap();
+    assert_eq!(fs::metadata(&source).unwrap().mode() & 0o777, 0o710);
+    if uid != 0 {
+        let denied = temp.path().join("denied");
+        let config = format!(
+            "path {} onto / as read-only mkdir uid=0 gid=0\n",
+            denied.display()
+        );
+        let mut namespace = Namespace::new(Config::parse(&config).unwrap(), None).unwrap();
+        assert_eq!(
+            namespace
+                .lookup(uid, Path::new(""))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert!(!denied.exists());
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".grayskillfs-mkdir-")
+        }));
+    }
+}
+
+#[test]
+fn mkdir_p_rejects_symlink_and_file_components_without_modifying_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let link = temp.path().join("link");
+    symlink(&outside, &link).unwrap();
+    let file = temp.path().join("file");
+    fs::write(&file, "unchanged").unwrap();
+    for prefix in [&link, &file] {
+        let config = format!(
+            "pathsubst {}/{{{{path}}}} onto / as read-only mkdir\n",
+            prefix.display()
+        );
+        let mut namespace = Namespace::new(Config::parse(&config).unwrap(), None).unwrap();
+        let error = namespace
+            .lookup(unsafe { libc::geteuid() }, Path::new("session"))
+            .unwrap_err();
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ELOOP | libc::ENOTDIR)
+        ));
+    }
+    assert!(!outside.join("session").exists());
+    assert_eq!(fs::read(file).unwrap(), b"unchanged");
+}
+
+#[test]
+fn mkdir_p_handles_concurrent_creators_without_leaving_staging_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = Root::new(temp.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let workers = (0..4)
+        .map(|_| {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                root.mkdir_p(Path::new("shared/session"), 0o750, uid, gid)
+                    .unwrap()
+                    .metadata(Path::new(""))
+                    .unwrap()
+                    .ino()
+            })
+        })
+        .collect::<Vec<_>>();
+    let inodes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(inodes.iter().all(|ino| *ino == inodes[0]));
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(temp.path().join("shared")).unwrap().count(), 1);
 }
 
 fn read(ns: &mut Namespace, path: &Path) -> String {
