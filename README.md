@@ -48,11 +48,12 @@ backing files through a root-run FUSE mount.
 
 ## Publishing
 
-`.github/workflows/publish.yml` publishes to crates.io on pushed `v*` tags, or
-manual dispatch **on an existing `v*` tag**. The tag must equal `v` plus the
-`Cargo.toml` version. It verifies the package before obtaining a short-lived
-OIDC token; no long-lived crates.io token belongs in GitHub secrets.
-The GitHub `crates-io` environment is restricted to `v*` tags.
+`.github/workflows/publish.yml` publishes to crates.io on pushed `releases/v*`
+tags, or manual dispatch **on an existing `releases/v*` tag**. The tag must
+equal `releases/v` plus the `Cargo.toml` version. It verifies the package
+before obtaining a short-lived OIDC token; no long-lived crates.io token belongs
+in GitHub secrets.
+The GitHub `crates-io` environment is restricted to `releases/v*` tags.
 
 Trusted Publishing requires an initial token-based publication and individual
 crate ownership; pending publishers are not supported. A verified crates.io

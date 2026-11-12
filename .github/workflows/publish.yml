@@ -2,7 +2,7 @@ name: Publish to crates.io
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["releases/v*"]
   workflow_dispatch:
 
 permissions: {}
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'grayskill/grayskillfs' && startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'grayskill/grayskillfs' && startsWith(github.ref, 'refs/tags/releases/v')
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -33,8 +33,8 @@ jobs:
           set -euo pipefail
           metadata=$(cargo metadata --locked --no-deps --format-version 1)
           version=$(jq -r '.packages[0].version' <<< "$metadata")
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::Release tag must match Cargo.toml version (v$version)."
+          if [[ "$GITHUB_REF_NAME" != "releases/v$version" ]]; then
+            echo "::error::Release tag must match Cargo.toml version (releases/v$version)."
             exit 1
           fi
           if ! jq -e '.packages[0] | (.license != null or .license_file != null)' <<< "$metadata" >/dev/null; then
