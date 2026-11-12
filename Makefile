@@ -10,8 +10,8 @@ $(error Run clean/distclean separately from build, test, or lint targets)
 endif
 endif
 
-.PHONY: all test test-mounted do-lint clean distclean help
-.PHONY: check-cargo check-build check-test check-mounted check-lint FORCE
+.PHONY: all test test-mounted test-privileges do-lint clean distclean help
+.PHONY: check-cargo check-build check-test check-mounted check-privileges check-lint FORCE
 
 all: $(CARGO_TARGET_DIR)/release/grayskillfs
 
@@ -24,7 +24,10 @@ test: check-test
 	+$(CARGO) test --all-targets --locked
 
 test-mounted: check-mounted
-	+$(CARGO) test --locked --test mounted -- --ignored --nocapture
+	+$(CARGO) test --locked --test mounted -- --ignored --nocapture --skip mounted_privilege_drop
+
+test-privileges: check-privileges
+	+$(CARGO) test --locked --test identity --test mounted --test request_uids privilege_drop -- --ignored --nocapture
 
 do-lint: check-lint
 	$(CARGO) fmt --all --check
@@ -60,6 +63,12 @@ check-mounted: check-test
 	@test -c /dev/fuse && test -r /dev/fuse && test -w /dev/fuse || { \
 		printf '%s\n' 'error: mounted tests require a readable/writable /dev/fuse device and permission to mount FUSE filesystems.' >&2; exit 1; }
 
+check-privileges: check-mounted
+	@for tool in unshare newuidmap newgidmap; do \
+		command -v "$$tool" >/dev/null 2>&1 || { \
+			printf 'error: privilege tests require %s, user/mount namespaces, subordinate UID/GID mappings, and a nobody account.\n' "$$tool" >&2; exit 1; }; \
+	done
+
 check-lint: check-build
 	@$(CARGO) fmt --version >/dev/null 2>&1 || { \
 		printf '%s\n' 'error: rustfmt is required; install it with rustup component add rustfmt.' >&2; exit 1; }
@@ -73,6 +82,7 @@ help:
 		'make              Build the release binary (default: target/release/grayskillfs).' \
 		'make test         Run automated tests without requiring a FUSE mount.' \
 		'make test-mounted Run live FUSE tests (Linux 5.8+, /proc, /dev/fuse, FUSE 3, Git).' \
+		'make test-privileges Test credential dropping in isolated user/mount namespaces.' \
 		'make do-lint      Check formatting and run strict Clippy linting.' \
 		'make clean        Remove Cargo build outputs.' \
 		'make distclean    Remove all generated build files (same as clean); keep Cargo.lock.' \

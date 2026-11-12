@@ -35,6 +35,42 @@ fn cli_encoding_validation_and_errors() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("unknown option: --uid"));
+    for (arguments, expected) in [
+        (vec!["--user"], "--user requires a user name or numeric UID"),
+        (vec!["--user", "0"], "unprivileged account"),
+        (
+            vec!["--user", "grayskillfs-no-such-user"],
+            "no system account",
+        ),
+        (vec!["--user", "4294967296"], "invalid numeric user ID"),
+    ] {
+        let result = Command::new(binary)
+            .arg("mount")
+            .arg(&config)
+            .arg(temp.path())
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        let result = Command::new(binary)
+            .arg("mount")
+            .arg(&config)
+            .arg(temp.path())
+            .arg("--user")
+            .arg(unsafe { libc::geteuid() }.to_string())
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("--user requires starting the daemon as root"));
+    }
     fs::write(&config, "path /base onto / as read-only\nno-consume pathsubst /data/{{uid}} onto /data as read-write\n").unwrap();
     let result = Command::new(binary)
         .arg("check")

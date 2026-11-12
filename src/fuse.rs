@@ -1,5 +1,6 @@
 use crate::backend::{check, component, errno};
 use crate::config::DeviceKind;
+use crate::identity::FsCredentials;
 use crate::namespace::{Entry, Location, Namespace, Node};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -18,6 +19,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::ZERO;
 type DirEntry = (u64, FileType, OsString);
+
+macro_rules! request_credentials {
+    ($req:ident, $reply:ident) => {
+        let _credentials = match FsCredentials::for_request($req.uid(), $req.gid()) {
+            Ok(credentials) => credentials,
+            Err(e) => {
+                $reply.error(error(e));
+                return;
+            }
+        };
+    };
+}
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ScopedPath {
@@ -333,6 +346,7 @@ impl LayerFs {
 #[allow(clippy::too_many_arguments)]
 impl Filesystem for LayerFs {
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        request_credentials!(req, reply);
         let result = (|| {
             let path = self.child(parent, name, req.uid())?;
             let entry = self.namespace.lookup(req.uid(), &path)?;
@@ -346,6 +360,7 @@ impl Filesystem for LayerFs {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        request_credentials!(req, reply);
         let result = (|| {
             if let Some(fh) = fh {
                 let handle = self.files.get(&fh).ok_or_else(|| errno(libc::EBADF))?;
@@ -369,6 +384,7 @@ impl Filesystem for LayerFs {
     }
 
     fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
+        request_credentials!(req, reply);
         match self
             .entry(ino, req.uid())
             .and_then(|entry| entry.read_link())
@@ -379,6 +395,7 @@ impl Filesystem for LayerFs {
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        request_credentials!(req, reply);
         let result = (|| {
             let entry = self.entry(ino, req.uid())?;
             let location = entry.location()?;
@@ -393,7 +410,7 @@ impl Filesystem for LayerFs {
 
     fn read(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -402,6 +419,7 @@ impl Filesystem for LayerFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             if offset < 0 {
                 return Err(errno(libc::EINVAL));
@@ -428,7 +446,7 @@ impl Filesystem for LayerFs {
 
     fn write(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -438,6 +456,7 @@ impl Filesystem for LayerFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             if offset < 0 {
                 return Err(errno(libc::EINVAL));
@@ -452,14 +471,8 @@ impl Filesystem for LayerFs {
         }
     }
 
-    fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _lock_owner: u64,
-        reply: ReplyEmpty,
-    ) {
+    fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        request_credentials!(req, reply);
         let result = self.file(fh, ino, false).and_then(|file| {
             let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
             if fd < 0 {
@@ -475,7 +488,7 @@ impl Filesystem for LayerFs {
 
     fn release(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         _ino: u64,
         fh: u64,
         _flags: i32,
@@ -483,13 +496,15 @@ impl Filesystem for LayerFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        request_credentials!(req, reply);
         if let Some(handle) = self.files.remove(&fh) {
             self.prune_identity(handle.ino);
         }
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        request_credentials!(req, reply);
         let result = self.file(fh, ino, false).and_then(|file| {
             if datasync {
                 file.sync_data()
@@ -504,6 +519,7 @@ impl Filesystem for LayerFs {
     }
 
     fn opendir(&mut self, req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        request_credentials!(req, reply);
         let result = (|| {
             let entries = self.directory(ino, req.uid())?;
             let entry = self.entry(ino, req.uid())?;
@@ -545,12 +561,13 @@ impl Filesystem for LayerFs {
 
     fn readdir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         _ino: u64,
         fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        request_credentials!(req, reply);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -569,12 +586,13 @@ impl Filesystem for LayerFs {
 
     fn releasedir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         _ino: u64,
         fh: u64,
         _flags: i32,
         reply: ReplyEmpty,
     ) {
+        request_credentials!(req, reply);
         self.directories.remove(&fh);
         if let Some(handle) = self.files.remove(&fh) {
             self.prune_identity(handle.ino);
@@ -584,12 +602,13 @@ impl Filesystem for LayerFs {
 
     fn fsyncdir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        request_credentials!(req, reply);
         if self.directories.contains_key(&fh) && !self.files.contains_key(&fh) {
             reply.ok();
             return;
@@ -608,6 +627,7 @@ impl Filesystem for LayerFs {
     }
 
     fn statfs(&mut self, req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
+        request_credentials!(req, reply);
         let result = (|| {
             let entry = self.entry(ino, req.uid())?;
             let location = match &entry.node {
@@ -645,6 +665,7 @@ impl Filesystem for LayerFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             let parent = self.path(parent)?;
             let location = self.namespace.destination(req.uid(), &parent, name)?;
@@ -671,6 +692,7 @@ impl Filesystem for LayerFs {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             let parent = self.path(parent)?;
             let location = self.namespace.destination(req.uid(), &parent, name)?;
@@ -689,6 +711,7 @@ impl Filesystem for LayerFs {
     }
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        request_credentials!(req, reply);
         match self.remove(parent, name, false, req.uid()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(error(e)),
@@ -696,6 +719,7 @@ impl Filesystem for LayerFs {
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        request_credentials!(req, reply);
         match self.remove(parent, name, true, req.uid()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(error(e)),
@@ -710,6 +734,7 @@ impl Filesystem for LayerFs {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             let parent = self.path(parent)?;
             let location = self.namespace.destination(req.uid(), &parent, name)?;
@@ -735,6 +760,7 @@ impl Filesystem for LayerFs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             if flags & !libc::RENAME_NOREPLACE != 0 {
                 return Err(errno(libc::EOPNOTSUPP));
@@ -806,6 +832,7 @@ impl Filesystem for LayerFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             let entry = self.entry(ino, req.uid())?;
             let source = entry.mutation()?;
@@ -842,6 +869,7 @@ impl Filesystem for LayerFs {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        request_credentials!(req, reply);
         let result = (|| {
             if uid.is_some()
                 || gid.is_some()

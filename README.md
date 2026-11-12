@@ -4,6 +4,8 @@ A Linux/Rust FUSE implementation of [the layering design](docs/design.txt).
 It assembles sandbox roots from host directories and immutable Git trees, with
 explicit read-only/read-write mappings. A 9p server is not implemented.
 
+See [examples/](examples/README.md) for shell, systemd and NixOS startup files.
+
 ## Build and test
 
 Requires Rust/Cargo (Rust 1.85+), a C linker, and Git on `PATH`. FUSE development
@@ -16,6 +18,8 @@ make test             # Automated tests without requiring a FUSE mount.
 make do-lint          # Formatting and strict Clippy checks.
 # Explicitly exercise a real, unprivileged mount; also requires make on PATH.
 make test-mounted
+# Additional isolated filesystem/Git credential tests; see requirements below.
+make test-privileges
 make help
 ```
 
@@ -34,6 +38,13 @@ The mounted test creates its own temporary backing directories and local Git
 repository, mounts the CLI in the foreground, exercises filesystem operations,
 and unmounts/cleans up on completion. It does not need root, change host settings,
 or contact external repositories.
+
+`make test-privileges` additionally needs `unshare` (util-linux), `newuidmap` and
+`newgidmap`, configured subordinate UID/GID mappings covering UID/GID 65534,
+unprivileged user/mount namespaces, and the `nobody` account (UID/GID 65534).
+It runs in private user/mount namespaces, not as host root, and verifies the
+Git-only credential dropping, scoped filesystem credentials, and client-owned
+backing files through a root-run FUSE mount.
 
 ## Configuration and mounting
 
@@ -62,7 +73,8 @@ UID**. Namespace views and inode identities are scoped by requester UID, with
 zero entry/attribute cache lifetimes. Directory traversal through a directory
 descriptor resolves new names for the current requester. Already-open file and
 directory descriptors stay bound to the mapping opened originally, following
-normal Unix descriptor semantics. There is no mount-time UID option.
+normal Unix descriptor semantics. `{{uid}}` cannot be overridden at mount time;
+`--user` changes only Git subprocess credentials.
 
 The first layer must mount onto `/`. Layers are applied in order. A later mount
 replaces the entire earlier subtree at its target, not a union of their files.
@@ -87,7 +99,48 @@ fusermount3 -u /path/to/mount
 `mount` runs in the foreground and validates fixed sources immediately.
 `--cache-dir DIRECTORY` chooses the parent of a private, per-mount temporary
 Git cache. The parent must exist; the cache is removed on normal unmount.
-No other user's cache or Git configuration is used.
+The cache is created lazily on the first Git request, under the daemon's runtime
+credentials. No other user's cache or Git configuration is used.
+
+### Git subprocess and filesystem credentials
+
+Use `--user USER` (account name or numeric UID) to run **Git subprocesses only**
+as an unprivileged account, keeping the daemon's credentials unchanged:
+
+```sh
+sudo target/release/grayskillfs mount /etc/grayskillfs.conf /mnt/grayskillfs \
+    --user grayskillfs --cache-dir /var/cache/grayskillfs --allow-other
+```
+
+The account must exist with a nonzero UID and primary GID. Starting with
+`--user` requires root; omitting it leaves Git running as the daemon's account.
+Before each Git command, its child process clears supplementary groups, sets
+real/effective/saved GID and UID to the selected account, clears
+permitted/effective/inheritable/ambient capabilities, and sets `no_new_privs`.
+Git's working directory is `/`. Credential-setting failures prevent the command
+from executing; the daemon's identity and working directory do not change.
+
+The daemon creates its private cache lazily, extracts snapshots itself, and
+gives Git a separate, account-owned `repositories/` directory. Git cannot replace
+daemon-owned snapshots or archive staging directories. The cache parent must
+allow the Git account to traverse to its workspace; keep the parent
+daemon-owned, non-writable by that account, and outside mount/backing trees
+(for example root-owned mode `0711` for `/var/cache/grayskillfs`).
+Repositories and their ancestors must be accessible to the Git account.
+
+`{{uid}}` still means the **client request UID**, independently of `--user`.
+When the daemon runs as root, backing operations use the request's UID/GID via
+thread-local Linux `setfsuid()`/`setfsgid()`, restoring previous IDs after each
+request, including errors. New files, directories and symlinks therefore acquire
+the caller's actual backing ownership without post-creation chown; normal
+backing setgid-directory inheritance also applies. Existing ownership is not
+remapped. Git/cache maintenance temporarily uses the daemon's filesystem IDs,
+independently of the requester, while Git children use `--user`.
+Supplementary groups are not impersonated; the kernel's `default_permissions`
+checks still use the caller's groups. A non-root daemon retains its own backing
+credentials and cannot represent arbitrary client ownership.
+The mount owner remains the startup user; `--allow-other` is needed for other
+client UIDs. This does not drop the daemon's root privileges.
 
 Git sources can be `{{path}}` (consume an encoded selector), or a fixed encoded
 selector (consume nothing and pin that tree on first access for each UID).
@@ -170,9 +223,9 @@ UID/GID, limits, seccomp and no-new-privileges. This project does not install a
 setuid wrapper or change the Grayskill One project.
 
 Mounts use `default_permissions`, `nosuid` and, unless `--allow-dev` is specified,
-`nodev`. Ownership and ordinary mode bits come from backing files (Git snapshots
-and newly created host files belong to the daemon); UID substitution does not
-impersonate callers or remap ownership. Prepare writable directories and file
+`nodev`. Ownership and ordinary mode bits come from backing files. Git snapshots
+belong to the daemon; root-run backing operations use the request's filesystem
+UID/GID, while non-root daemons create files as themselves. Prepare directories and file
 modes/group permissions appropriately for the sandbox users.
 `--allow-other` explicitly enables other users and needs `user_allow_other`
 in `/etc/fuse.conf` for an unprivileged daemon. Without it only the mounting
@@ -180,7 +233,7 @@ user can use the filesystem. Do not run the daemon as root unnecessarily.
 
 Configuration, backing directory administrators and selector callers must be
 trusted. A caller that can choose Git selectors can fetch repositories and
-use the daemon's filesystem/network access; only file, HTTP(S) and SSH Git
+use Git's configured filesystem/network access; only file, HTTP(S) and SSH Git
 transports are enabled. Git runs without inherited Git configuration,
 credential helpers, hooks, SSH config or interactive prompts. SSH may still
 use the daemon account's default identity files. There is no remote allowlist,

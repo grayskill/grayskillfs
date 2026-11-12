@@ -1,20 +1,22 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use fuser::MountOption;
-use grayskillfs::{config::Config, fuse::LayerFs, namespace::Namespace};
+use fuser::{MountOption, Session};
+use grayskillfs::{config::Config, fuse::LayerFs, identity::Identity, namespace::Namespace};
 use std::io;
 use std::path::PathBuf;
 
 const USAGE: &str = "\
 Usage:
-  grayskillfs mount CONFIG MOUNTPOINT [--cache-dir DIRECTORY] [--allow-other] [--allow-dev]
+  grayskillfs mount CONFIG MOUNTPOINT [--user USER|UID] [--cache-dir DIRECTORY] [--allow-other] [--allow-dev]
   grayskillfs check CONFIG
   grayskillfs encode REPOSITORY REF
 
 Mount runs in the foreground. Unmount with: fusermount3 -u MOUNTPOINT
 {{uid}} is the UID of the process making each filesystem request.
 --allow-other requires user_allow_other in /etc/fuse.conf for unprivileged mounts.
---allow-dev enables native device I/O; normally requires a privileged mount.";
+--allow-dev enables native device I/O; normally requires a privileged mount.
+--user runs only Git subprocesses as that account's UID and primary GID, with
+cleared groups/capabilities. The daemon keeps its credentials; starting as root is required.";
 
 fn run() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -61,6 +63,7 @@ fn run() -> io::Result<()> {
     let mut cache = None;
     let mut allow_other = false;
     let mut allow_dev = false;
+    let mut user = None;
     while let Some(option) = args.next() {
         if option == "--cache-dir" {
             cache =
@@ -71,6 +74,13 @@ fn run() -> io::Result<()> {
             allow_other = true;
         } else if option == "--allow-dev" {
             allow_dev = true;
+        } else if option == "--user" {
+            if user.is_some() {
+                return Err(invalid("--user may only be specified once"));
+            }
+            user = Some(Identity::resolve(&args.next().ok_or_else(|| {
+                invalid("--user requires a user name or numeric UID")
+            })?)?);
         } else {
             return Err(invalid(format!(
                 "unknown option: {}",
@@ -78,10 +88,15 @@ fn run() -> io::Result<()> {
             )));
         }
     }
+    if let Some(user) = &user {
+        user.require_root()?;
+    }
+    let mountpoint = std::fs::canonicalize(mountpoint)?;
+    let cache = cache.map(std::fs::canonicalize).transpose()?;
     if config.has_devices() && !allow_dev {
         eprintln!("grayskillfs: configured device nodes are visible but I/O is disabled by nodev; use --allow-dev for native device I/O");
     }
-    let namespace = Namespace::new(config, cache.as_deref())?;
+    let namespace = Namespace::new_with_git_user(config, cache.as_deref(), user)?;
     let mut options = vec![
         MountOption::FSName("grayskillfs".into()),
         MountOption::DefaultPermissions,
@@ -96,7 +111,8 @@ fn run() -> io::Result<()> {
     if allow_other {
         options.push(MountOption::AllowOther);
     }
-    fuser::mount2(LayerFs::new(namespace), mountpoint, &options)
+    let mut session = Session::new(LayerFs::new(namespace), mountpoint, &options)?;
+    session.run()
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {

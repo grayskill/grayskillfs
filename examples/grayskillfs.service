@@ -1,0 +1,26 @@
+[Unit]
+Description=Grayskill sandbox assembly filesystem
+Wants=network-online.target
+After=network-online.target systemd-tmpfiles-setup.service
+RequiresMountsFor=/srv/grayskillfs/base
+
+[Service]
+Type=exec
+# The daemon needs root for requester filesystem IDs; --user affects only Git.
+User=root
+Group=root
+WorkingDirectory=/
+RuntimeDirectory=grayskillfs
+RuntimeDirectoryMode=0755
+CacheDirectory=grayskillfs
+CacheDirectoryMode=0711
+ExecStartPre=/usr/bin/install -d -m 0755 /run/grayskillfs/mnt
+ExecStartPre=/usr/local/bin/grayskillfs check /etc/grayskillfs.conf
+ExecStart=/usr/local/bin/grayskillfs mount /etc/grayskillfs.conf /run/grayskillfs/mnt --user grayskillfs-git --cache-dir /var/cache/grayskillfs --allow-other
+ExecStop=/usr/bin/fusermount3 -uz /run/grayskillfs/mnt
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

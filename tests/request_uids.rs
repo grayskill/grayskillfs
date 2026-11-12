@@ -1,6 +1,7 @@
 use fuser::{Session, SessionACL};
 use grayskillfs::{config::Config, fuse::LayerFs, namespace::Namespace};
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -120,6 +121,7 @@ impl Drop for Protocol {
 #[test]
 fn fuse_requests_select_uid_views_inodes_and_mutation_destinations() {
     let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let base = temp.path().join("base");
     let data = temp.path().join("data");
     fs::create_dir(&base).unwrap();
@@ -127,6 +129,9 @@ fn fuse_requests_select_uid_views_inodes_and_mutation_destinations() {
         fs::create_dir_all(data.join(uid.to_string())).unwrap();
         fs::write(data.join(format!("{uid}/shared")), content).unwrap();
         fs::write(data.join(format!("{uid}/only-{uid}")), "").unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            common::chown_tree(&data.join(uid.to_string()), uid, 100);
+        }
     }
     let config = format!(
         "path {} onto / as read-only\npathsubst {}/{{{{uid}}}} onto /data as read-write\n",
@@ -160,6 +165,12 @@ fn fuse_requests_select_uid_views_inodes_and_mutation_destinations() {
     fs.write(43, created43, fh43, b"43");
     assert_eq!(fs::read(data.join("42/created")).unwrap(), b"42");
     assert_eq!(fs::read(data.join("43/created")).unwrap(), b"43");
+    if unsafe { libc::geteuid() } == 0 {
+        for uid in [42, 43] {
+            let metadata = fs::metadata(data.join(format!("{uid}/created"))).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (uid, 100));
+        }
+    }
 
     let mut rename = dir42.to_ne_bytes().to_vec();
     rename.extend_from_slice(b"created\0renamed\0");
@@ -184,3 +195,15 @@ fn fuse_requests_select_uid_views_inodes_and_mutation_destinations() {
     assert!(names.contains(&"only-43"));
     assert!(!names.contains(&"only-42"));
 }
+
+#[test]
+#[ignore = "requires user namespaces and subordinate UID/GID mappings"]
+fn privilege_drop_fuse_requests_preserve_caller_ownership() {
+    if common::in_user_namespace(
+        "privilege_drop_fuse_requests_preserve_caller_ownership",
+        "GRAYSKILLFS_REQUEST_CREDENTIALS_TEST_CHILD",
+    ) {
+        fuse_requests_select_uid_views_inodes_and_mutation_destinations();
+    }
+}
+mod common;

@@ -1,6 +1,7 @@
 use crate::backend::{component, errno, Root};
 use crate::config::{Config, Device, Kind};
 use crate::git::GitStore;
+use crate::identity::{FsCredentials, Identity};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{File, Metadata};
@@ -234,9 +235,17 @@ pub struct Namespace {
 
 impl Namespace {
     pub fn new(config: Config, cache: Option<&Path>) -> io::Result<Self> {
+        Self::new_with_git_user(config, cache, None)
+    }
+
+    pub fn new_with_git_user(
+        config: Config,
+        cache: Option<&Path>,
+        git_user: Option<Identity>,
+    ) -> io::Result<Self> {
         let mut namespace = Self {
             config,
-            git: GitStore::new(cache)?,
+            git: GitStore::new(cache, git_user),
             views: HashMap::new(),
             roots: HashMap::new(),
         };
@@ -342,7 +351,10 @@ impl Namespace {
                 } else {
                     PathBuf::from(source)
                 };
-                let root = if layer.kind == Kind::PathSubst && layer.source.contains("{{") {
+                let root = if layer.kind == Kind::Git {
+                    let _credentials = FsCredentials::daemon()?;
+                    self.root(&source)?
+                } else if layer.kind == Kind::PathSubst && layer.source.contains("{{") {
                     self.substituted_root(&layer.source, &source)?
                 } else {
                     self.root(&source)?

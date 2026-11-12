@@ -43,6 +43,50 @@ pub fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+pub fn in_user_namespace(test: &str, marker: &str) -> bool {
+    if std::env::var_os(marker).is_some() {
+        return true;
+    }
+    let output = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--map-auto",
+            "--setgroups",
+            "allow",
+            "--mount",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--ignored", "--nocapture"])
+        .env(marker, "1")
+        .output()
+        .expect("install util-linux unshare and configure subordinate UID/GID mappings");
+    assert!(
+        output.status.success(),
+        "isolated namespace test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+pub fn chown_tree(path: &Path, uid: u32, gid: u32) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            chown_tree(&entry.unwrap().path(), uid, gid);
+        }
+    }
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::lchown(name.as_ptr(), uid, gid) },
+        0,
+        "chown {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
 impl Fixture {
     pub fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();

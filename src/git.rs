@@ -1,4 +1,5 @@
-use crate::backend::errno;
+use crate::backend::{errno, Root};
+use crate::identity::{FsCredentials, Identity};
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -12,7 +13,9 @@ use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 pub struct GitStore {
-    cache: TempDir,
+    cache: Option<TempDir>,
+    parent: Option<PathBuf>,
+    user: Option<Identity>,
     snapshots: HashMap<(String, String), PathBuf>,
 }
 
@@ -21,7 +24,7 @@ pub struct Selection {
     pub root: PathBuf,
 }
 
-fn command(repository: &Path) -> Command {
+fn command(repository: &Path, user: Option<Identity>) -> io::Result<Command> {
     let mut cmd = Command::new("git");
     cmd.env_clear();
     // Do not inherit GIT_*, loader overrides, credential helpers, hooks, or SSH
@@ -49,7 +52,11 @@ fn command(repository: &Path) -> Command {
             "protocol.ssh.allow=always",
         ])
         .stdin(Stdio::null());
-    cmd
+    if let Some(user) = user {
+        user.configure_command(&mut cmd)?;
+        cmd.current_dir("/");
+    }
+    Ok(cmd)
 }
 
 fn output(mut cmd: Command) -> io::Result<Output> {
@@ -64,20 +71,41 @@ fn output(mut cmd: Command) -> io::Result<Output> {
 }
 
 impl GitStore {
-    pub fn new(parent: Option<&Path>) -> io::Result<Self> {
+    pub fn new(parent: Option<&Path>, user: Option<Identity>) -> Self {
+        Self {
+            cache: None,
+            parent: parent.map(Path::to_owned),
+            user,
+            snapshots: HashMap::new(),
+        }
+    }
+
+    fn cache(&mut self) -> io::Result<PathBuf> {
+        if let Some(cache) = &self.cache {
+            return Ok(cache.path().to_owned());
+        }
         let mut builder = tempfile::Builder::new();
         builder.prefix("grayskillfs-");
-        let cache = match parent {
+        let cache = match &self.parent {
             Some(parent) => builder.tempdir_in(parent)?,
             None => builder.tempdir()?,
         };
-        Ok(Self {
-            cache,
-            snapshots: HashMap::new(),
-        })
+        let repositories = cache.path().join("repositories");
+        fs::create_dir(&repositories)?;
+        fs::set_permissions(&repositories, fs::Permissions::from_mode(0o700))?;
+        if let Some(user) = self.user {
+            user.own_directory(&fs::File::open(&repositories)?)?;
+            // Git can traverse to its own workspace but cannot replace the
+            // daemon-owned snapshot trees alongside it.
+            fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o711))?;
+        }
+        let path = cache.path().to_owned();
+        self.cache = Some(cache);
+        Ok(path)
     }
 
     pub fn select(&mut self, selector: &str) -> io::Result<Selection> {
+        let _credentials = FsCredentials::daemon()?;
         let bytes = URL_SAFE_NO_PAD
             .decode(selector)
             .or_else(|_| URL_SAFE.decode(selector))
@@ -99,32 +127,39 @@ impl GitStore {
         // Permit names, HEAD and object IDs, not revision expressions/refspecs.
         let hash = reference.len() == 40 || reference.len() == 64;
         let hash = hash && reference.bytes().all(|b| b.is_ascii_hexdigit());
+        let cache = self.cache()?;
         if !hash && reference != "HEAD" {
-            let mut check = command(self.cache.path());
+            let mut check = command(&cache, self.user)?;
             check.args(["check-ref-format", "--allow-onelevel", reference]);
             if !check.output()?.status.success() {
                 return Err(errno(libc::ENOENT));
             }
         }
         let key = format!("{:x}", Sha256::digest(url.as_bytes()));
-        let repository = self.cache.path().join(format!("{key}.git"));
+        let repositories = cache.join("repositories");
+        let repository_name = format!("{key}.git");
+        let repository = repositories.join(&repository_name);
         if !repository.exists() {
-            let mut init = command(&repository);
+            let mut init = command(&repository, self.user)?;
             init.args(["init", "--bare"]);
             output(init)?;
             // A snapshot represents the tree, not a release archive altered by
             // repository-controlled export-ignore/export-subst attributes.
-            fs::write(
-                repository.join("info/attributes"),
-                b"* -export-ignore -export-subst\n",
+            let repository_root = Root::new(&repositories)?.subdir(Path::new(&repository_name))?;
+            let mut attributes = repository_root.open(
+                Path::new("info/attributes"),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o644,
             )?;
+            use std::io::Write;
+            attributes.write_all(b"* -export-ignore -export-subst\n")?;
         }
         if !hash
             || !self
                 .snapshots
                 .contains_key(&(url.to_owned(), reference.to_owned()))
         {
-            let mut fetch = command(&repository);
+            let mut fetch = command(&repository, self.user)?;
             fetch.args([
                 "fetch",
                 "--quiet",
@@ -136,7 +171,7 @@ impl GitStore {
             ]);
             output(fetch)?;
         }
-        let mut resolve = command(&repository);
+        let mut resolve = command(&repository, self.user)?;
         if hash {
             resolve.args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")]);
         } else {
@@ -151,12 +186,12 @@ impl GitStore {
         let root = if let Some(root) = self.snapshots.get(&snapshot_key) {
             root.clone()
         } else {
-            let mut archive = command(&repository);
+            let mut archive = command(&repository, self.user)?;
             archive.args(["archive", "--format=tar", &commit]);
             let data = output(archive)?;
             let staging = tempfile::Builder::new()
                 .prefix("tree-")
-                .tempdir_in(self.cache.path())?;
+                .tempdir_in(&cache)?;
             let mut archive = tar::Archive::new(data.stdout.as_slice());
             archive.set_preserve_permissions(false);
             for entry in archive.entries()? {
@@ -183,7 +218,7 @@ impl GitStore {
                     return Err(io::Error::other("git archive entry escaped snapshot"));
                 }
             }
-            let destination = self.cache.path().join(format!("{key}-{commit}"));
+            let destination = cache.join(format!("{key}-{commit}"));
             fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o755))?;
             fs::rename(staging.path(), &destination)?;
             self.snapshots.insert(snapshot_key, destination.clone());

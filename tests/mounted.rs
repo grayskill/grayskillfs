@@ -35,6 +35,10 @@ impl Drop for Mount {
 }
 
 fn mount(fixture: &Fixture) -> Mount {
+    mount_with_options(fixture, &[])
+}
+
+fn mount_with_options(fixture: &Fixture, options: &[&std::ffi::OsStr]) -> Mount {
     let path = fixture.temp.path().join("mount");
     fs::create_dir(&path).unwrap();
     let config = fixture.temp.path().join("config");
@@ -43,6 +47,7 @@ fn mount(fixture: &Fixture) -> Mount {
         .arg("mount")
         .arg(config)
         .arg(&path)
+        .args(options)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -315,4 +320,168 @@ fn mounted_virtual_devices_report_types_numbers_and_nodev() {
     );
     assert!(fs::remove_file(root.join("dev/null")).is_err());
     assert_eq!(fs::read_dir(root.join("dev")).unwrap().count(), 2);
+}
+
+#[test]
+#[ignore = "requires user/mount namespaces, subordinate IDs, nobody account, and FUSE"]
+fn mounted_privilege_drop_is_git_only() {
+    use std::ffi::OsStr;
+    use std::os::unix::process::CommandExt;
+    if !common::in_user_namespace(
+        "mounted_privilege_drop_is_git_only",
+        "GRAYSKILLFS_MOUNT_DROP_TEST_CHILD",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let cache = fixture.temp.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    common::chown_tree(&fixture.repo, 65534, 65534);
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o711)).unwrap();
+    fs::set_permissions(fixture.temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let data = fixture.data.join("65533");
+    fs::create_dir(&data).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::write(data.join("existing"), "root-owned").unwrap();
+    fs::set_permissions(data.join("existing"), fs::Permissions::from_mode(0o666)).unwrap();
+    fs::create_dir(data.join("sticky")).unwrap();
+    fs::set_permissions(data.join("sticky"), fs::Permissions::from_mode(0o1777)).unwrap();
+    fs::write(data.join("sticky/secret"), "root-owned").unwrap();
+    let mount = mount_with_options(
+        &fixture,
+        &[
+            OsStr::new("--user"),
+            OsStr::new("nobody"),
+            OsStr::new("--allow-other"),
+            OsStr::new("--cache-dir"),
+            cache.as_os_str(),
+        ],
+    );
+    assert_eq!(
+        fs::read_dir(&cache).unwrap().count(),
+        0,
+        "Git cache must be lazy"
+    );
+    let root = mount.path.join(fixture.symbolic()).join("alice");
+    assert_eq!(fs::read(root.join("package/repo.txt")).unwrap(), b"git\n");
+    let status = fs::read_to_string(format!("/proc/{}/status", mount.child.id())).unwrap();
+    for field in ["Uid:", "Gid:"] {
+        let values = status
+            .lines()
+            .find(|line| line.starts_with(field))
+            .unwrap()
+            .split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["0"; 4], "daemon credentials must remain unchanged");
+    }
+    let synthetic = fs::metadata(root.join("package/src")).unwrap();
+    assert_eq!(synthetic.uid(), 0, "backing ownership must not be remapped");
+    let output = Command::new("sh")
+        .args([
+            "-ec",
+            r#"
+            cd "$1"
+            test "$(cat package/repo.txt)" = git
+            test "$(cat base.txt)" = base
+            printf created > package/data/created
+            mkdir package/data/directory
+            ln -s created package/data/symlink
+            ln package/data/created package/data/hardlink
+            mv package/data/created package/data/renamed
+            chmod 640 package/data/renamed
+            printf updated > package/data/existing
+            if rm package/data/sticky/secret; then exit 1; fi
+            ls package/data >/dev/null
+        "#,
+            "--",
+        ])
+        .arg(&root)
+        .uid(65533)
+        .gid(65532)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in ["renamed", "directory", "symlink", "hardlink"] {
+        let metadata = fs::symlink_metadata(data.join(path)).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (65533, 65532), "{path}");
+    }
+    let existing = fs::metadata(data.join("existing")).unwrap();
+    assert_eq!((existing.uid(), existing.gid()), (0, 0));
+    assert_eq!(fs::read(data.join("existing")).unwrap(), b"updated");
+    assert_eq!(fs::read(data.join("sticky/secret")).unwrap(), b"root-owned");
+    assert_eq!(fs::read(root.join("package/repo.txt")).unwrap(), b"git\n");
+    for entry in fs::read_dir(&cache).unwrap() {
+        let entry = entry.unwrap();
+        let metadata = entry.metadata().unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (0, 0));
+        let repositories = entry.path().join("repositories");
+        let metadata = fs::metadata(&repositories).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
+        for repository in fs::read_dir(&repositories).unwrap() {
+            let repository = repository.unwrap();
+            if repository.file_name().to_string_lossy().ends_with(".git") {
+                let metadata = fs::metadata(repository.path().join("HEAD")).unwrap();
+                assert_eq!(
+                    metadata.uid(),
+                    65534,
+                    "Git subprocess must run as the target user"
+                );
+                assert_eq!(metadata.gid(), 65534);
+            }
+        }
+        for snapshot in fs::read_dir(entry.path()).unwrap() {
+            let snapshot = snapshot.unwrap();
+            if snapshot.file_name() == "repositories" {
+                continue;
+            }
+            assert_eq!(snapshot.metadata().unwrap().uid(), 0);
+            assert_eq!(
+                fs::metadata(snapshot.path().join("repo.txt"))
+                    .unwrap()
+                    .uid(),
+                0
+            );
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-ec",
+                    r#"test ! -w "$1"; test ! -w "$2"; test -w "$3""#,
+                    "--",
+                ])
+                .arg(entry.path())
+                .arg(snapshot.path())
+                .arg(&repositories);
+            grayskillfs::identity::Identity::resolve(OsStr::new("nobody"))
+                .unwrap()
+                .configure_command(&mut command)
+                .unwrap();
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Git user can modify daemon snapshots"
+            );
+        }
+    }
+    // Git cannot use the daemon's retained access to root-only repositories.
+    let secret = fixture.temp.path().join("root-only");
+    fs::create_dir(&secret).unwrap();
+    common::git(&secret, &["init", "-b", "main"]);
+    fs::write(secret.join("secret"), "must not be accessible to Git").unwrap();
+    common::git(&secret, &["add", "."]);
+    common::git(&secret, &["commit", "-m", "private"]);
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o700)).unwrap();
+    let selector = Command::new(env!("CARGO_BIN_EXE_grayskillfs"))
+        .arg("encode")
+        .arg(&secret)
+        .arg("HEAD")
+        .output()
+        .unwrap();
+    let selector = String::from_utf8(selector.stdout).unwrap();
+    assert!(fs::read_link(mount.path.join(selector.trim())).is_err());
 }
