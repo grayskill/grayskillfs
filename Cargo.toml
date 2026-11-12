@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A selector-addressed layered filesystem for sandbox roots"
+license = "MIT"
+repository = "https://github.com/grayskill/grayskillfs"
 
 [dependencies]
 base64 = "0.22"

@@ -46,6 +46,43 @@ It runs in private user/mount namespaces, not as host root, and verifies the
 Git-only credential dropping, scoped filesystem credentials, and client-owned
 backing files through a root-run FUSE mount.
 
+## Publishing
+
+`.github/workflows/publish.yml` publishes to crates.io on pushed `v*` tags, or
+manual dispatch **on an existing `v*` tag**. The tag must equal `v` plus the
+`Cargo.toml` version. It verifies the package before obtaining a short-lived
+OIDC token; no long-lived crates.io token belongs in GitHub secrets.
+The GitHub `crates-io` environment is restricted to `v*` tags.
+
+Trusted Publishing requires an initial token-based publication and individual
+crate ownership; pending publishers are not supported. A verified crates.io
+email and linked GitHub account are also required. The package is MIT-licensed.
+The publisher identity for this repository is:
+
+| Setting | Value |
+| --- | --- |
+| Crate | `grayskillfs` |
+| Repository owner | `grayskill` |
+| Repository name | `grayskillfs` |
+| Workflow filename | `publish.yml` |
+| Environment | `crates-io` |
+
+These settings are managed through
+[crates.io Trusted Publishing](https://crates.io/docs/trusted-publishing).
+
+The official API also supports creation with
+`POST /api/v1/trusted_publishing/github_configs`; the JSON body is
+`{"github_config":{"crate":"grayskillfs","repository_owner":"grayskill","repository_name":"grayskillfs","workflow_filename":"publish.yml","environment":"crates-io"}}`.
+Authentication requires a crate owner's API token with the `trusted_publishing`
+scope (or an applicable legacy token). The local `crates.io-api-key` is ignored
+by Git and explicitly excluded from Cargo packages; never commit it or put it
+in a workflow. Workflow changes must be reviewed and pushed before automation
+can run. Creating/pushing a matching version tag or dispatching the workflow on
+one authorizes a real publish, not a dry run.
+
+Each new release needs a new package version; an already-published version
+cannot be published again.
+
 ## Configuration and mounting
 
 Configuration is whitespace-separated, one layer per line. Blank lines and

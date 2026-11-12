@@ -43,33 +43,24 @@ that the FUSE mount is ready before accessing it.
 ## NixOS
 
 Copy this directory into your NixOS configuration tree and add this import to
-`configuration.nix`, replacing the revision with a full commit containing the
-current implementation:
+`configuration.nix`:
 
 ```nix
 {
-  imports = [
-    (import ./examples/nixos.nix {
-      gitUrl = "https://github.com/grayskill/grayskillfs.git";
-      gitRev = "REPLACE_WITH_FULL_COMMIT_ID";
-      # For a non-default branch, also set gitRef = "refs/heads/BRANCH".
-    })
-  ];
+  imports = [ ./examples/nixos.nix ];
 }
 ```
 
-Run `sudo nixos-rebuild switch`. The module builds the pinned source with the
-repository's Makefile and locked Cargo dependencies, runs the ordinary tests
+Run `sudo nixos-rebuild switch`. The module downloads `grayskillfs` 0.1.0 from
+crates.io with a pinned SHA-256 checksum, builds it with the packaged Makefile
+and locked Cargo dependencies, and runs the ordinary tests
 (not the opt-in mounted/namespace tests), installs the CLI, provisions the Git
 account and base directory, and enables the same unit shown above. Git, SSH and
 FUSE helper paths are included in the package wrapper and service environment;
 the daemon still runs as root, not as the Git account.
 
 The module is a native Linux build example, not a flake or cross-build setup.
-For a future GitHub release tarball, replace the `src = builtins.fetchGit { ... };`
-expression with `pkgs.fetchzip { url = "..."; hash = "sha256-..."; }`, using the
-published release URL and actual fixed hash. Keep `Cargo.lock` in the archive
-and update `version` accordingly.
+To upgrade, update `version` and the `pkgs.fetchCrate` source hash together.
 
 ## Using the mount
 

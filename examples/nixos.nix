@@ -1,20 +1,15 @@
-{
-  gitUrl,
-  gitRev,
-  gitRef ? "HEAD",
-}:
 { lib, pkgs, ... }:
 let
-  src = builtins.fetchGit {
-    url = gitUrl;
-    rev = gitRev;
-    ref = gitRef;
+  version = "0.1.0";
+  src = pkgs.fetchCrate {
+    pname = "grayskillfs";
+    inherit version;
+    hash = "sha256-kfScG44wWSE3sPBcPTjAPPZ6spzUq0RiAgulMdupncs=";
   };
   runtimeTools = [ pkgs.git pkgs.openssh pkgs.fuse3 ];
   package = pkgs.rustPlatform.buildRustPackage {
     pname = "grayskillfs";
-    version = "0.1.0-${builtins.substring 0 7 gitRev}";
-    inherit src;
+    inherit version src;
     cargoLock.lockFile = src + "/Cargo.lock";
 
     nativeBuildInputs = [ pkgs.gnumake pkgs.makeWrapper ];
