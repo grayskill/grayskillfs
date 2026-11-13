@@ -83,6 +83,37 @@ fn mount_with_options(fixture: &Fixture, options: &[&std::ffi::OsStr]) -> Mount 
 
 #[test]
 #[ignore = "requires Linux /dev/fuse and fusermount3; run explicitly"]
+fn mounted_large_hardlinked_directory_does_not_stall() {
+    let mut fixture = Fixture::new();
+    let original = fixture.base.join("base.txt");
+    for index in 0..20_000 {
+        fs::hard_link(&original, fixture.base.join(format!("alias-{index:05}"))).unwrap();
+    }
+    fixture.config = format!("path {} onto / as read-only\n", fixture.base.display());
+    let mount = mount(&fixture);
+    let path = mount.path.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader =
+        std::thread::spawn(move || {
+            send.send(fs::read_dir(path).and_then(|mut entries| {
+                entries.try_fold(0, |count, entry| entry.map(|_| count + 1))
+            }))
+            .unwrap();
+        });
+    let count = receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("hard-linked directory listing stalled")
+        .unwrap();
+    reader.join().unwrap();
+    assert_eq!(count, 20_002);
+    assert_eq!(
+        fs::metadata(mount.path.join("alias-00000")).unwrap().ino(),
+        fs::metadata(mount.path.join("alias-19999")).unwrap().ino()
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3; run explicitly"]
 fn mounted_base64_path_allows_git_commits_in_backing_worktree() {
     let mut fixture = Fixture::new();
     fixture.config = format!(

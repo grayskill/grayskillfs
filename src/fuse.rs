@@ -152,8 +152,10 @@ impl LayerFs {
         };
         let existing = self.identities.get(&identity).copied();
         let scoped = ScopedPath::new(uid, path.clone());
-        if self.inodes.get(&scoped).copied() != existing {
-            self.forget_path(&path, uid);
+        if let Some(mapped) = self.inodes.get(&scoped).copied() {
+            if Some(mapped) != existing {
+                self.forget_path(&path, uid);
+            }
         }
         let ino = if let Some(ino) = existing {
             self.inodes.insert(scoped.clone(), ino);
