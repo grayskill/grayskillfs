@@ -216,12 +216,24 @@ impl Config {
                 if kind == Kind::Path && source.contains("{{") {
                     return Err(invalid("use pathsubst for substitutions"));
                 }
-                let remaining = source.replace("{{path}}", "").replace("{{uid}}", "");
+                if source.contains("{{base64Path}}")
+                    && (kind != Kind::PathSubst || source != "{{base64Path}}")
+                {
+                    return Err(invalid(
+                        "{{base64Path}} must be the entire source of a pathsubst layer",
+                    ));
+                }
+                let remaining = source
+                    .replace("{{path}}", "")
+                    .replace("{{uid}}", "")
+                    .replace("{{base64Path}}", "");
                 if remaining.contains(['{', '}']) {
                     return Err(invalid("unknown substitution"));
                 }
                 let source = source.to_owned();
-                if matches!(kind, Kind::Path | Kind::PathSubst) && !Path::new(&source).is_absolute()
+                if matches!(kind, Kind::Path | Kind::PathSubst)
+                    && source != "{{base64Path}}"
+                    && !Path::new(&source).is_absolute()
                 {
                     return Err(invalid("source must be absolute"));
                 }
@@ -238,7 +250,7 @@ impl Config {
                 if matches!(kind, Kind::Dev(_)) && target == Path::new("/") {
                     return Err(invalid("a device cannot replace the filesystem root"));
                 }
-                let consumes = source.contains("{{path}}");
+                let consumes = source.contains("{{path}}") || source == "{{base64Path}}";
                 Ok(Layer {
                     kind,
                     source,

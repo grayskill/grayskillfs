@@ -32,6 +32,10 @@ fn configuration_semantics_and_errors() {
         "path /base onto / as writable",
         "path /{{path}} onto / as read-only",
         "pathsubst /{{unknown}} onto / as read-only",
+        "path {{base64Path}} onto / as read-only",
+        "git {{base64Path}} onto / as read-only",
+        "pathsubst /prefix/{{base64Path}} onto / as read-only",
+        "pathsubst {{base64Path}}/{{path}} onto / as read-only",
         "no-consume pathsubst /{{path}} onto / as read-only",
         "git {{path}} onto / as read-write",
         "no-consume git {{path}} onto / as read-only",
@@ -254,6 +258,94 @@ fn design_example_layers_and_git_tree_are_exact() {
     );
     assert_eq!(
         ns.lookup(42, &root.join("package/.git"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENOENT)
+    );
+}
+
+#[test]
+fn base64_path_selectors_map_writable_directories_and_reject_invalid_paths() {
+    let fixture = Fixture::new();
+    let repo = fixture.temp.path().join("repo with spaces");
+    fs::rename(&fixture.repo, &repo).unwrap();
+    let config = format!(
+        "path {} onto / as read-only\n\
+         pathsubst {{{{base64Path}}}} onto /app as read-write\n",
+        fixture.base.display()
+    );
+    let config = Config::parse(&config).unwrap();
+    assert_eq!(config.selectors(), 1);
+    let mut ns = Namespace::new(config, None).unwrap();
+    for selector in [
+        URL_SAFE_NO_PAD.encode(repo.as_os_str().as_encoded_bytes()),
+        URL_SAFE.encode(repo.as_os_str().as_encoded_bytes()),
+    ] {
+        let root = Path::new(&selector);
+        assert_eq!(read(&mut ns, &root.join("app/repo.txt")), "git\n");
+        assert!(ns.lookup(42, &root.join("app/.git")).unwrap().is_dir());
+        let location = ns
+            .destination(42, &root.join("app"), OsStr::new("created"))
+            .unwrap();
+        location
+            .open(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o600)
+            .unwrap();
+        assert!(repo.join("created").is_file());
+    }
+    let link = fixture.temp.path().join("link");
+    symlink(&repo, &link).unwrap();
+    let selector = URL_SAFE_NO_PAD.encode(link.as_os_str().as_encoded_bytes());
+    assert!(ns.lookup(42, Path::new(&selector)).is_err());
+    for invalid in [
+        "relative/path".to_owned(),
+        format!("{}/../repo with spaces", fixture.temp.path().display()),
+        format!("{}/./repo with spaces", fixture.temp.path().display()),
+        format!("{}\n", repo.display()),
+        "/tmp/\0".to_owned(),
+    ] {
+        let selector = URL_SAFE_NO_PAD.encode(invalid.as_bytes());
+        assert_eq!(
+            ns.lookup(42, Path::new(&selector))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
+    for selector in ["not-base64!", &URL_SAFE_NO_PAD.encode([0xff])] {
+        assert_eq!(
+            ns.lookup(42, Path::new(selector))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
+}
+
+#[test]
+fn incomplete_selector_skips_unrelated_non_consuming_sources() {
+    let fixture = Fixture::new();
+    let config = format!(
+        "path {} onto / as read-only\n\
+         git {{{{path}}}} onto /package as read-only\n\
+         pathsubst {}/{{{{uid}}}} onto /data as read-write\n\
+         pathsubst {}/{{{{path}}}} onto /tmp as read-write\n",
+        fixture.base.display(),
+        fixture.temp.path().join("missing-data").display(),
+        fixture.users.display()
+    );
+    let mut ns = Namespace::new(Config::parse(&config).unwrap(), None).unwrap();
+    let target = ns
+        .lookup(42, Path::new(&fixture.symbolic()))
+        .unwrap()
+        .read_link()
+        .unwrap();
+    assert_eq!(target, OsStr::new(&fixture.selector));
+    assert!(ns
+        .lookup(42, Path::new(&fixture.selector))
+        .unwrap()
+        .is_dir());
+    assert_eq!(
+        ns.lookup(42, &Path::new(&fixture.selector).join("alice"))
             .unwrap_err()
             .raw_os_error(),
         Some(libc::ENOENT)

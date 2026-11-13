@@ -100,11 +100,35 @@ dev char 1 3 onto /dev/null as read-write
 
 Create the backing directories before using them, or explicitly enable
 `mkdir` as described below. A layer consumes one selector
-component **only if its source contains `{{path}}`**, regardless of how many
+component **only if its source contains `{{path}}` or is `{{base64Path}}`**, regardless of how many
 times that placeholder appears. `{{path}}` is that layer's single selector
 component, not a path or a previous selector. Fixed sources and sources using
 only `{{uid}}` consume nothing. The old `no-consume` keyword is no longer accepted.
 `path` is a fixed mapping; use `pathsubst` for host-path substitutions.
+
+For a writable build worktree, use:
+
+```text
+pathsubst {{base64Path}} onto /grayskill/app as read-write
+```
+
+The entire source must be `{{base64Path}}`. It consumes one URL-safe base64
+selector (with or without padding), decoded as an absolute UTF-8 host directory
+path, not a repository/ref pair. Spaces in the decoded path are supported;
+NUL, line breaks, `.`/`..` components, and symlink components are rejected.
+The directory is pinned and operations use requester filesystem credentials,
+just like other host mappings. A normal Git worktree, including `.git`, is
+exposed directly, so builds can commit to the backing repository.
+
+**Only trusted code may supply these selectors.** Encoding is not access control:
+an absolute-path selector can expose any directory accessible to the requester,
+including writable host files. The sandbox launcher must select and validate the
+repository before entering the assembled root. This is not a Git snapshot.
+
+For example, encode a worktree path with
+`printf %s /srv/worktrees/app | base64 -w0 | tr '+/' '-_' | tr -d '='`.
+If another layer consumes a session selector, the build root is
+`MOUNT/ENCODED-WORKTREE/SESSION-ID`.
 
 `{{uid}}` is the accessing process's filesystem UID from each FUSE request
 (`Request::uid()`, equivalent to `fuse_get_context()->uid`), **not the daemon's

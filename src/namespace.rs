@@ -2,6 +2,8 @@ use crate::backend::{component, errno, Root};
 use crate::config::{Config, Device, Kind};
 use crate::git::GitStore;
 use crate::identity::{FsCredentials, Identity};
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{File, Metadata};
@@ -285,6 +287,9 @@ impl Namespace {
             }
             prefix.push(part);
         }
+        if prefix.as_os_str().is_empty() {
+            prefix.push("/");
+        }
         let base = self.root(&prefix)?;
         let relative = source
             .strip_prefix(&prefix)
@@ -319,6 +324,9 @@ impl Namespace {
             }
         }
         for (index, layer) in self.config.layers.clone().into_iter().enumerate() {
+            if selectors.len() < count && !layer.consumes {
+                continue;
+            }
             let selector = if layer.consumes {
                 if consumed == selectors.len() {
                     return Ok(Entry {
@@ -337,7 +345,22 @@ impl Namespace {
             };
             let source = layer.source.replace("{{uid}}", &uid.to_string());
             let source = if let Some(selector) = selector {
-                source.replace("{{path}}", selector)
+                if source == "{{base64Path}}" {
+                    let decoded = URL_SAFE_NO_PAD
+                        .decode(selector)
+                        .or_else(|_| URL_SAFE.decode(selector))
+                        .map_err(|_| errno(libc::EINVAL))?;
+                    let decoded = String::from_utf8(decoded).map_err(|_| errno(libc::EINVAL))?;
+                    if !Path::new(&decoded).is_absolute()
+                        || decoded.contains(['\0', '\n', '\r'])
+                        || decoded.split('/').any(|part| matches!(part, "." | ".."))
+                    {
+                        return Err(errno(libc::EINVAL));
+                    }
+                    decoded
+                } else {
+                    source.replace("{{path}}", selector)
+                }
             } else {
                 source
             };

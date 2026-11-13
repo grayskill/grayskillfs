@@ -1,6 +1,8 @@
 mod common;
 
-use common::Fixture;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use common::{git, Fixture};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
@@ -77,6 +79,61 @@ fn mount_with_options(fixture: &Fixture, options: &[&std::ffi::OsStr]) -> Mount 
         std::thread::sleep(Duration::from_millis(20));
     }
     Mount { child, path }
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3; run explicitly"]
+fn mounted_base64_path_allows_git_commits_in_backing_worktree() {
+    let mut fixture = Fixture::new();
+    fixture.config = format!(
+        "path {} onto / as read-only\n\
+         pathsubst {{{{base64Path}}}} onto /app as read-write\n",
+        fixture.base.display()
+    );
+    let mount = mount(&fixture);
+    let selector = URL_SAFE_NO_PAD.encode(fixture.repo.as_os_str().as_encoded_bytes());
+    let app = mount.path.join(selector).join("app");
+    fs::write(app.join("built.txt"), "build output\n").unwrap();
+    git(&app, &["add", "built.txt"]);
+    git(&app, &["commit", "-m", "build through grayskillfs"]);
+    let commit = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert_ne!(commit, fixture.commit);
+    assert_eq!(
+        git(&fixture.repo, &["show", "HEAD:built.txt"]),
+        "build output"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3; run explicitly"]
+fn mounted_incomplete_selector_skips_missing_non_consuming_source() {
+    let mut fixture = Fixture::new();
+    let data = fixture.temp.path().join("late-data");
+    fixture.config = format!(
+        "path {} onto / as read-only\n\
+         git {{{{path}}}} onto /package as read-only\n\
+         pathsubst {}/{{{{uid}}}} onto /data as read-write\n\
+         pathsubst {}/{{{{path}}}} onto /tmp as read-write\n",
+        fixture.base.display(),
+        data.display(),
+        fixture.users.display()
+    );
+    let mount = mount(&fixture);
+    let symbolic = mount.path.join(fixture.symbolic());
+    assert_eq!(
+        fs::read_link(&symbolic).unwrap(),
+        Path::new(&fixture.selector)
+    );
+    assert!(fs::metadata(&symbolic).unwrap().is_dir());
+    assert_eq!(
+        fs::metadata(symbolic.join("alice")).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    fs::create_dir_all(data.join(unsafe { libc::geteuid() }.to_string())).unwrap();
+    assert_eq!(
+        fs::read_to_string(symbolic.join("alice/package/repo.txt")).unwrap(),
+        "git\n"
+    );
 }
 
 #[test]
