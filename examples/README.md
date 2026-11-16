@@ -65,26 +65,31 @@ sudo umount /run/grayskillfs/mnt
 ```
 
 To run it under systemd instead of the script, install and enable the separate
-unit:
+server and mount units:
 
 ```sh
 sudo install -m 0644 examples/grayskillfs-9p.service \
     /etc/systemd/system/grayskillfs-9p.service
+sudo install -m 0644 examples/run-grayskillfs-mnt.mount \
+    /etc/systemd/system/run-grayskillfs-mnt.mount
 sudo systemctl daemon-reload
-sudo systemctl enable --now grayskillfs-9p.service
+sudo systemctl enable --now run-grayskillfs-mnt.mount
 ```
 
-The unit creates the socket in a root-only runtime directory and uses a
-separate Git cache from the FUSE service. Mounting the 9P export is a separate
-host operation; unmount it before stopping the service. On NixOS, enable the
-client modules in addition to the FUSE module in `examples/nixos.nix`:
+The server creates the socket in a root-only runtime directory and uses a
+separate Git cache from the FUSE service. The mount unit starts the server
+through its dependency and stops the mount if the server stops. Stop both units
+with `sudo systemctl stop run-grayskillfs-mnt.mount grayskillfs-9p.service`.
+On NixOS, enable the client modules in addition to the FUSE module in
+`examples/nixos.nix`:
 
 ```nix
 boot.kernelModules = [ "fuse" "9p" "9pnet" "9pnet_fd" ];
 ```
 
-Install `examples/grayskillfs-9p.service` as a system unit to use the same
-systemd startup procedure on NixOS.
+Install both `examples/grayskillfs-9p.service` and
+`examples/run-grayskillfs-mnt.mount` as system units to use the same systemd
+startup procedure on NixOS.
 
 ## NixOS
 

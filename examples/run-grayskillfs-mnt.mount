@@ -1,0 +1,15 @@
+[Unit]
+Description=Grayskill sandbox assembly filesystem (9P mount)
+DefaultDependencies=no
+BindsTo=grayskillfs-9p.service
+After=grayskillfs-9p.service
+Before=multi-user.target
+
+[Mount]
+What=/run/grayskillfs/9p.sock
+Where=/run/grayskillfs/mnt
+Type=9p
+Options=trans=unix,version=9p2000.L
+
+[Install]
+WantedBy=multi-user.target
