@@ -4,7 +4,7 @@ use crate::identity::FsCredentials;
 use crate::namespace::{Entry, Location, Namespace, Node};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -662,6 +662,89 @@ impl Filesystem for LayerFs {
                 stat.f_frsize as u32,
             ),
             Ok(None) => reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096),
+            Err(e) => reply.error(error(e)),
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        request_credentials!(req, reply);
+        let result = (|| {
+            if position != 0 {
+                return Err(errno(libc::EOPNOTSUPP));
+            }
+            let entry = self.entry(ino, req.uid(), req.gid())?;
+            let location = entry.mutation()?;
+            location
+                .root
+                .set_xattr(&location.relative, name, value, flags)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(error(e)),
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        request_credentials!(req, reply);
+        let result = (|| {
+            let entry = self.entry(ino, req.uid(), req.gid())?;
+            let location = entry.location()?;
+            location.root.get_xattr(&location.relative, name)
+        })();
+        match result {
+            Ok(value) if size == 0 => match value.len().try_into() {
+                Ok(size) => reply.size(size),
+                Err(_) => reply.error(libc::E2BIG),
+            },
+            Ok(value) if value.len() > size as usize => reply.error(libc::ERANGE),
+            Ok(value) => reply.data(&value),
+            Err(e) => reply.error(error(e)),
+        }
+    }
+
+    fn listxattr(&mut self, req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        request_credentials!(req, reply);
+        let result = (|| {
+            let entry = self.entry(ino, req.uid(), req.gid())?;
+            let location = entry.location()?;
+            location.root.list_xattrs(&location.relative)
+        })();
+        match result {
+            Ok(names) if size == 0 => match names.len().try_into() {
+                Ok(size) => reply.size(size),
+                Err(_) => reply.error(libc::E2BIG),
+            },
+            Ok(names) if names.len() > size as usize => reply.error(libc::ERANGE),
+            Ok(names) => reply.data(&names),
+            Err(e) => reply.error(error(e)),
+        }
+    }
+
+    fn removexattr(&mut self, req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        request_credentials!(req, reply);
+        let result = (|| {
+            let entry = self.entry(ino, req.uid(), req.gid())?;
+            let location = entry.mutation()?;
+            location.root.remove_xattr(&location.relative, name)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(error(e)),
         }
     }

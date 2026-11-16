@@ -285,6 +285,84 @@ impl Root {
         })
     }
 
+    fn xattr_file(&self, path: &Path) -> io::Result<File> {
+        let pinned = self.open(path, libc::O_PATH, 0)?;
+        let metadata = pinned.metadata()?;
+        let flags = if metadata.is_dir() {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK
+        } else if metadata.is_file() {
+            libc::O_RDONLY | libc::O_NONBLOCK
+        } else {
+            return Err(errno(libc::EOPNOTSUPP));
+        };
+        let path = CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd())).unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub fn get_xattr(&self, path: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
+        let file = self.xattr_file(path)?;
+        let name = CString::new(name.as_bytes()).map_err(|_| errno(libc::EINVAL))?;
+        let size =
+            unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut value = vec![0; size as usize];
+        let read = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        value.truncate(read as usize);
+        Ok(value)
+    }
+
+    pub fn list_xattrs(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let file = self.xattr_file(path)?;
+        let size = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut names = vec![0; size as usize];
+        let read =
+            unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len()) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        names.truncate(read as usize);
+        Ok(names)
+    }
+
+    pub fn set_xattr(&self, path: &Path, name: &OsStr, value: &[u8], flags: i32) -> io::Result<()> {
+        let file = self.xattr_file(path)?;
+        let name = CString::new(name.as_bytes()).map_err(|_| errno(libc::EINVAL))?;
+        check(unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                flags,
+            )
+        })
+    }
+
+    pub fn remove_xattr(&self, path: &Path, name: &OsStr) -> io::Result<()> {
+        let file = self.xattr_file(path)?;
+        let name = CString::new(name.as_bytes()).map_err(|_| errno(libc::EINVAL))?;
+        check(unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) })
+    }
+
     pub fn probe_openat2(&self) -> io::Result<()> {
         self.open(Path::new(""), libc::O_PATH | libc::O_DIRECTORY, 0)?;
         Ok(())

@@ -81,6 +81,63 @@ fn mount_with_options(fixture: &Fixture, options: &[&std::ffi::OsStr]) -> Mount 
     Mount { child, path }
 }
 
+fn get_xattr(path: &Path, name: &str) -> std::io::Result<Vec<u8>> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut value = vec![0; size as usize];
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if read < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    value.truncate(read as usize);
+    Ok(value)
+}
+
+fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn list_xattrs(path: &Path) -> std::io::Result<Vec<u8>> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut names = vec![0; size as usize];
+    let read = unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    if read < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    names.truncate(read as usize);
+    Ok(names)
+}
+
 #[test]
 #[ignore = "requires Linux /dev/fuse and fusermount3; run explicitly"]
 fn mounted_large_hardlinked_directory_does_not_stall() {
@@ -377,6 +434,75 @@ fn mounted_design_example_and_posix_operations() {
             .filter(|name| name.to_string_lossy().starts_with("entry-"))
             .count(),
         400
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3; run explicitly"]
+fn mounted_xattrs_and_acls_pass_through() {
+    let fixture = Fixture::new();
+    let backing = fixture
+        .data
+        .join(unsafe { libc::geteuid() }.to_string())
+        .join("existing");
+    let readonly_backing = fixture.base.join("base.txt");
+    set_xattr(&readonly_backing, "user.grayskillfs-test", b"backing").unwrap();
+
+    let mount = mount(&fixture);
+    let root = mount.path.join(fixture.symbolic()).join("alice");
+    let writable = root.join("package/data/existing");
+    let readonly = root.join("base.txt");
+    assert_eq!(
+        get_xattr(&readonly, "user.grayskillfs-test").unwrap(),
+        b"backing"
+    );
+    assert!(list_xattrs(&readonly)
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .any(|name| name == b"user.grayskillfs-test"));
+    assert!(set_xattr(&readonly, "user.grayskillfs-test", b"changed").is_err());
+    assert_eq!(
+        get_xattr(&readonly_backing, "user.grayskillfs-test").unwrap(),
+        b"backing"
+    );
+
+    set_xattr(&writable, "user.grayskillfs-test", b"mounted").unwrap();
+    assert_eq!(
+        get_xattr(&backing, "user.grayskillfs-test").unwrap(),
+        b"mounted"
+    );
+
+    let acl = [
+        2, 0, 0, 0, // POSIX ACL xattr version
+        1, 0, 6, 0, 255, 255, 255, 255, // user_obj
+        2, 0, 4, 0, 57, 48, 0, 0, // named user 12345
+        4, 0, 4, 0, 255, 255, 255, 255, // group_obj
+        16, 0, 4, 0, 255, 255, 255, 255, // mask
+        32, 0, 0, 0, 255, 255, 255, 255, // other
+    ];
+    set_xattr(&writable, "system.posix_acl_access", &acl).unwrap();
+    assert_eq!(get_xattr(&backing, "system.posix_acl_access").unwrap(), acl);
+    assert_eq!(
+        get_xattr(&writable, "system.posix_acl_access").unwrap(),
+        acl
+    );
+
+    let name = std::ffi::CString::new("user.grayskillfs-test").unwrap();
+    let writable_path = std::ffi::CString::new(writable.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::removexattr(writable_path.as_ptr(), name.as_ptr()) },
+        0
+    );
+    assert!(get_xattr(&backing, "user.grayskillfs-test").is_err());
+
+    let readonly_path = std::ffi::CString::new(readonly.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::removexattr(readonly_path.as_ptr(), name.as_ptr()) },
+        -1
+    );
+    assert_eq!(
+        get_xattr(&readonly_backing, "user.grayskillfs-test").unwrap(),
+        b"backing"
     );
 }
 
