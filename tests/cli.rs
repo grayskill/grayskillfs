@@ -6,6 +6,9 @@ use std::process::Command;
 #[test]
 fn cli_encoding_validation_and_errors() {
     let binary = env!("CARGO_BIN_EXE_grayskillfs");
+    let result = Command::new(binary).arg("--help").output().unwrap();
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("serve-9p CONFIG SOCKET"));
     let result = Command::new(binary)
         .args(["encode", "https://example.invalid/repo.git", "main"])
         .output()

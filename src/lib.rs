@@ -6,3 +6,4 @@ pub mod fuse;
 pub mod git;
 pub mod identity;
 pub mod namespace;
+pub mod p9;

@@ -1,16 +1,18 @@
 # grayskillfs
 
-A Linux/Rust FUSE implementation of [the layering design](docs/design.txt).
-It assembles sandbox roots from host directories and immutable Git trees, with
-explicit read-only/read-write mappings. A 9p server is not implemented.
+A Linux/Rust implementation of [the layering design](docs/design.txt), with
+FUSE and 9P2000.L access to the same assembled filesystem. It combines host
+directories and immutable Git trees with explicit read-only/read-write mappings.
 
 See [examples/](examples/README.md) for shell, systemd and NixOS startup files.
 
 ## Build and test
 
 Requires Rust/Cargo (Rust 1.85+), a C linker, and Git on `PATH`. FUSE development
-libraries are not needed. Mounting requires Linux 5.8+ (`openat2` and
-`utimensat(AT_EMPTY_PATH)`), mounted `/proc`, `/dev/fuse`, and `fusermount3`.
+libraries are not needed. Both frontends require Linux 5.8+ (`openat2` and
+`utimensat(AT_EMPTY_PATH)`) and mounted `/proc`. FUSE mounting additionally
+requires `/dev/fuse` and `fusermount3`; 9P mounting requires the Linux 9P client
+filesystem and does not use FUSE.
 
 ```sh
 make                  # Build target/release/grayskillfs.
@@ -161,7 +163,23 @@ fusermount3 -u /path/to/mount
 
 `check` validates syntax without fetching repositories or opening sources.
 `mount` runs in the foreground and validates fixed sources immediately, except
-sources explicitly configured for lazy creation.
+sources explicitly configured for lazy creation. To export the same namespace
+over a local Unix socket instead, run:
+
+```sh
+target/release/grayskillfs serve-9p /path/to/config /run/grayskillfs.sock
+# In another terminal, with the Linux 9P filesystem enabled:
+mkdir -p /path/to/mount
+mount -t 9p -o trans=unix,version=9p2000.L /run/grayskillfs.sock /path/to/mount
+```
+
+`serve-9p` runs in the foreground. The socket is created with the process's
+normal umask; restrict access to trusted clients because the export uses the
+connecting Unix peer's UID and GID for `{{uid}}` selection and filesystem
+credentials. The 9P service supports standard 9P2000.L Linux clients. 9P and
+FUSE can be run as alternate frontends, but must use separate processes and
+their own cache directories.
+
 `--cache-dir DIRECTORY` chooses the parent of a private, per-mount temporary
 Git cache. The parent must exist; the cache is removed on normal unmount.
 The cache is created lazily on the first Git request, under the daemon's runtime
