@@ -1,15 +1,16 @@
 # Startup examples
 
 These examples keep the daemon root-run, use `grayskillfs-git` only for Git
-subprocesses, and allow other UIDs to use the mount. They leave native device I/O
-disabled. The daemon is privileged; do not treat these launchers as a sandbox.
+subprocesses, and leave native device I/O disabled. The daemon is privileged;
+do not treat these launchers as a sandbox.
 
 ## Shell or ordinary systemd
 
 Build with `make`, install `target/release/grayskillfs` as
-`/usr/local/bin/grayskillfs`, and install Git, OpenSSH and FUSE 3. Create an
-unprivileged system account and primary group named `grayskillfs-git`, with
-nonzero UID/GID. Then prepare the example configuration and source directory:
+`/usr/local/bin/grayskillfs`, and install Git and OpenSSH. For the FUSE example,
+install FUSE 3 as well. Create an unprivileged system account and primary group
+named `grayskillfs-git`, with nonzero UID/GID. Then prepare the example
+configuration and source directory:
 
 ```sh
 sudo install -m 0644 examples/grayskillfs.conf /etc/grayskillfs.conf
@@ -39,6 +40,51 @@ Stopping the service lazily detaches the mount, including when clients hold
 files open; stop sandbox workloads before stopping the filesystem. `Type=exec`
 confirms process startup, not mount readiness; dependent workloads must check
 that the FUSE mount is ready before accessing it.
+
+## 9P over a local Unix socket
+
+The 9P example serves the same configuration without mounting FUSE. Install
+Linux's 9P client support (`9p`, `9pnet`, and `9pnet_fd` kernel modules) on the
+host, then start the foreground server:
+
+```sh
+sudo sh examples/start-9p.sh
+```
+
+The script accepts `GRAYSKILLFS_BIN`, `GRAYSKILLFS_CONFIG`,
+`GRAYSKILLFS_SOCKET`, `GRAYSKILLFS_CACHE_DIR`, and `GRAYSKILLFS_GIT_USER`
+overrides. It creates a private socket at `/run/grayskillfs/9p.sock`; only root
+can connect by default. In another terminal, mount and later unmount the export:
+
+```sh
+sudo install -d -m 0755 /run/grayskillfs/mnt
+sudo mount -t 9p -o trans=unix,version=9p2000.L \
+    /run/grayskillfs/9p.sock /run/grayskillfs/mnt
+ls /run/grayskillfs/mnt
+sudo umount /run/grayskillfs/mnt
+```
+
+To run it under systemd instead of the script, install and enable the separate
+unit:
+
+```sh
+sudo install -m 0644 examples/grayskillfs-9p.service \
+    /etc/systemd/system/grayskillfs-9p.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now grayskillfs-9p.service
+```
+
+The unit creates the socket in a root-only runtime directory and uses a
+separate Git cache from the FUSE service. Mounting the 9P export is a separate
+host operation; unmount it before stopping the service. On NixOS, enable the
+client modules in addition to the FUSE module in `examples/nixos.nix`:
+
+```nix
+boot.kernelModules = [ "fuse" "9p" "9pnet" "9pnet_fd" ];
+```
+
+Install `examples/grayskillfs-9p.service` as a system unit to use the same
+systemd startup procedure on NixOS.
 
 ## NixOS
 
