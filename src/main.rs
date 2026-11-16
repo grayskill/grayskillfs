@@ -8,11 +8,14 @@ use std::path::PathBuf;
 const USAGE: &str = "\
 Usage:
   grayskillfs mount CONFIG MOUNTPOINT [--user USER|UID] [--cache-dir DIRECTORY] [--allow-other] [--allow-dev]
+  grayskillfs serve-9p CONFIG SOCKET [--user USER|UID] [--cache-dir DIRECTORY]
   grayskillfs check CONFIG
   grayskillfs encode REPOSITORY REF
 
-Mount runs in the foreground. Unmount with: fusermount3 -u MOUNTPOINT
-{{uid}} is the UID of the process making each filesystem request.
+Mount and serve-9p run in the foreground. Unmount FUSE with: fusermount3 -u MOUNTPOINT
+Unmount a 9P mount with: umount MOUNTPOINT
+Mount a 9P export with: mount -t 9p -o trans=unix,version=9p2000.L SOCKET MOUNTPOINT
+{{uid}} is the FUSE request UID or 9P Unix-socket peer UID.
 --allow-other requires user_allow_other in /etc/fuse.conf for unprivileged mounts.
 --allow-dev enables native device I/O; normally requires a privileged mount.
 --user runs only Git subprocesses as that account's UID and primary GID, with
@@ -43,7 +46,7 @@ fn run() -> io::Result<()> {
         );
         return Ok(());
     }
-    if action != "check" && action != "mount" {
+    if action != "check" && action != "mount" && action != "serve-9p" {
         return Err(invalid(USAGE));
     }
     let config = args.next().ok_or_else(|| invalid(USAGE))?;
@@ -91,28 +94,38 @@ fn run() -> io::Result<()> {
     if let Some(user) = &user {
         user.require_root()?;
     }
-    let mountpoint = std::fs::canonicalize(mountpoint)?;
+    if action == "mount" {
+        let mountpoint = std::fs::canonicalize(mountpoint)?;
+        let cache = cache.map(std::fs::canonicalize).transpose()?;
+        if config.has_devices() && !allow_dev {
+            eprintln!("grayskillfs: configured device nodes are visible but I/O is disabled by nodev; use --allow-dev for native device I/O");
+        }
+        let namespace = Namespace::new_with_git_user(config, cache.as_deref(), user)?;
+        let mut options = vec![
+            MountOption::FSName("grayskillfs".into()),
+            MountOption::DefaultPermissions,
+            MountOption::NoSuid,
+            if allow_dev {
+                MountOption::Dev
+            } else {
+                MountOption::NoDev
+            },
+            MountOption::RW,
+        ];
+        if allow_other {
+            options.push(MountOption::AllowOther);
+        }
+        let mut session = Session::new(LayerFs::new(namespace), mountpoint, &options)?;
+        return session.run();
+    }
+    if allow_other || allow_dev {
+        return Err(invalid(
+            "--allow-other and --allow-dev are only supported by mount",
+        ));
+    }
     let cache = cache.map(std::fs::canonicalize).transpose()?;
-    if config.has_devices() && !allow_dev {
-        eprintln!("grayskillfs: configured device nodes are visible but I/O is disabled by nodev; use --allow-dev for native device I/O");
-    }
     let namespace = Namespace::new_with_git_user(config, cache.as_deref(), user)?;
-    let mut options = vec![
-        MountOption::FSName("grayskillfs".into()),
-        MountOption::DefaultPermissions,
-        MountOption::NoSuid,
-        if allow_dev {
-            MountOption::Dev
-        } else {
-            MountOption::NoDev
-        },
-        MountOption::RW,
-    ];
-    if allow_other {
-        options.push(MountOption::AllowOther);
-    }
-    let mut session = Session::new(LayerFs::new(namespace), mountpoint, &options)?;
-    session.run()
+    grayskillfs::p9::serve(&mountpoint, namespace)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
