@@ -298,12 +298,14 @@ device node as protection against privileged writes or destructive ioctls.
 
 Regular file I/O, execution, create, mkdir, unlink/rmdir, rename (including
 no-replace), hard links within one mapping, symlinks, truncate, chmod, timestamps,
-directory streams, fsync and backing filesystem statistics are implemented.
-Cross-mapping renames/hard links are rejected. Mount points and ancestors of
-nested mounts cannot be removed or renamed. Configured virtual devices are
-supported as described above; ordinary backing-file opens remain limited to
-regular files. Ownership changes, client special-file creation, FIFO opens,
-xattrs/ACLs and rename-exchange/whiteouts are not implemented.
+directory streams, fsync, backing filesystem statistics, and xattrs on regular
+files and directories are implemented. POSIX ACL xattrs are passed through
+unchanged to the backing filesystem. Cross-mapping renames/hard links are
+rejected. Mount points and ancestors of nested mounts cannot be removed or
+renamed. Configured virtual devices are supported as described above; ordinary
+backing-file opens remain limited to regular files. Ownership changes, client
+special-file creation, FIFO opens, xattrs on symlinks and special files, and
+rename-exchange/whiteouts are not implemented.
 Setuid/setgid/sticky mode bits are not exposed or set.
 
 Host source directories are pinned by descriptors. Substituted sources are
